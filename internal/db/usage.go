@@ -86,11 +86,11 @@ func (r *Repo) GetUsageDailyRecent(limit int) ([]string, error) {
 	for rows.Next() {
 		var data string
 		if err := rows.Scan(&data); err != nil {
-			continue
+			return nil, fmt.Errorf("scan usageDaily recent: %w", err)
 		}
 		res = append(res, data)
 	}
-	return res, nil
+	return res, rows.Err()
 }
 
 // GetUsageHistorySince returns usage history records since the cutoff timestamp.
@@ -116,11 +116,11 @@ func (r *Repo) GetUsageHistorySince(cutoff string) ([]UsageHistoryRow, error) {
 			&row.APIKey, &row.Endpoint, &row.PromptTokens, &row.CompletionTokens,
 			&row.Cost, &row.Status, &row.Tokens,
 		); err != nil {
-			continue
+			return nil, fmt.Errorf("scan usageHistory since %s: %w", cutoff, err)
 		}
 		res = append(res, row)
 	}
-	return res, nil
+	return res, rows.Err()
 }
 
 // GetRecentUsageHistory returns the latest N usage history records.
@@ -146,11 +146,11 @@ func (r *Repo) GetRecentUsageHistory(limit int) ([]UsageHistoryRow, error) {
 			&row.APIKey, &row.Endpoint, &row.PromptTokens, &row.CompletionTokens,
 			&row.Cost, &row.Status, &row.Tokens,
 		); err != nil {
-			continue
+			return nil, fmt.Errorf("scan recent usageHistory: %w", err)
 		}
 		res = append(res, row)
 	}
-	return res, nil
+	return res, rows.Err()
 }
 
 // GetRequestDetailsPaged returns paged raw json strings and total count from requestDetails.
@@ -174,9 +174,9 @@ func (r *Repo) GetRequestDetailsPaged(limit, offset int) ([]string, int, error) 
 	for rows.Next() {
 		var d string
 		if err := rows.Scan(&d); err != nil {
-			continue
+			return nil, total, fmt.Errorf("scan requestDetails: %w", err)
 		}
 		res = append(res, d)
 	}
-	return res, total, nil
+	return res, total, rows.Err()
 }

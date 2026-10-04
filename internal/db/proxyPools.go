@@ -186,7 +186,7 @@ func (r *Repo) ListProxyPools() ([]map[string]any, error) {
 		var id, testStatus, dataStr, createdAt, updatedAt string
 		var isActiveInt int
 		if err := rows.Scan(&id, &isActiveInt, &testStatus, &dataStr, &createdAt, &updatedAt); err != nil {
-			continue
+			return nil, fmt.Errorf("scan proxyPools: %w", err)
 		}
 		var poolData map[string]any
 		if err := json.Unmarshal([]byte(dataStr), &poolData); err != nil {
@@ -198,6 +198,9 @@ func (r *Repo) ListProxyPools() ([]map[string]any, error) {
 		poolData["createdAt"] = createdAt
 		poolData["updatedAt"] = updatedAt
 		list = append(list, poolData)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate proxyPools: %w", err)
 	}
 	if list == nil {
 		list = []map[string]any{}
