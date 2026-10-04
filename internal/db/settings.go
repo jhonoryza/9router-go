@@ -13,13 +13,28 @@ type ComboStrategy struct {
 	JudgeModel  string `json:"judgeModel,omitempty"`
 }
 
-// ProviderStrategy defines routing and proxy pool options for a specific provider.
+// ProviderStrategy defines routing and proxy pool options for a specific
+// provider.
+//
+// The dashboard saves two independent rotations to this provider. The
+// `isNoAuth` block of the provider card writes pool rotation to
+// `rotateStrategy`, and the round-robin toggle writes connection rotation to
+// `fallbackStrategy`. GetSettings used to fold both into RotateStrategy, which
+// made saving one silently arm the other.
+//
+// ProxyRotateStrategy and ConnRotateStrategy now keep them apart.
+// RotateStrategy keeps reading `rotateStrategy` first and falling back to
+// `fallbackStrategy`, so a provider that sets only one still gets a strategy —
+// and that fallback is why pool rotation must stay behind a NoAuth gate: for a
+// keyed provider `rotateStrategy` is an account-rotation value and must never
+// steer egress. See connRotationStrategy in the chat package.
 type ProviderStrategy struct {
 	ProxyPoolID           string `json:"proxyPoolId,omitempty"`
 	RotateStrategy        string `json:"rotateStrategy,omitempty"` // "none", "round-robin", "random", "sticky"
 	StickyLimit           int    `json:"stickyLimit,omitempty"`
 	StrictModelAssignment bool   `json:"strictModelAssignment,omitempty"`
 	ProxyRotateStrategy   string `json:"proxyRotateStrategy,omitempty"`
+	ConnRotateStrategy    string `json:"connRotateStrategy,omitempty"`
 }
 
 // CapacityAdapterEntry defines settings for an input-modality capability adapter pool.
@@ -172,19 +187,11 @@ func (r *Repo) GetSettings() (*SettingsData, error) {
 		}
 	}
 
-	// Per-provider strategies. Three independent keys land here, so they must
-	// not be folded together:
-	//
-	//   - `fallbackStrategy` / `rotateStrategy` — connection rotation
-	//     (which account serves the next request). `rotateStrategy` is read
-	//     first so an operator who set only one of the two still gets a
-	//     strategy.
-	//   - `proxyRotateStrategy` — proxy pool rotation (which egress pool
-	//     serves it). Kept separate because pool and connection rotation are
-	//     independent operators: sharing the key made saving one silently arm
-	//     the other.
-	//   - `proxyPoolId` — a single pinned pool, outranking both when set.
-	//
+	// Per-provider strategies. See ProviderStrategy for why the two rotations
+	// are carried separately: the provider card saves pool rotation to
+	// `rotateStrategy` and connection rotation to `fallbackStrategy`, and
+	// folding them into one field made saving either silently arm the other.
+	// `proxyPoolId` pins a single pool and outranks both.
 	// `stickyRoundRobinLimit` / `stickyLimit` belong to connection rotation.
 	if ps, ok := raw["providerStrategies"].(map[string]any); ok {
 		s.ProviderStrategies = make(map[string]ProviderStrategy, len(ps))
@@ -204,14 +211,8 @@ func (r *Repo) GetSettings() (*SettingsData, error) {
 					ProxyPoolID:         handlerutil.GetString(vm, "proxyPoolId"),
 					RotateStrategy:      rotateStrat,
 					StickyLimit:         sticky,
-					ProxyRotateStrategy: handlerutil.GetString(vm, "proxyRotateStrategy"),
-				}
-				// The dashboard wrote pool rotation to `rotateStrategy` before
-				// `proxyRotateStrategy` existed, so honour both. Only the old
-				// key carries the ambiguity: with it set, `rotateStrategy`
-				// above doubles as the connection strategy.
-				if strat.ProxyRotateStrategy == "" {
-					strat.ProxyRotateStrategy = handlerutil.GetString(vm, "rotateStrategy")
+					ProxyRotateStrategy: handlerutil.GetString(vm, "rotateStrategy"),
+					ConnRotateStrategy:  handlerutil.GetString(vm, "fallbackStrategy"),
 				}
 				if sma, ok := vm["strictModelAssignment"].(bool); ok {
 					strat.StrictModelAssignment = sma
@@ -305,11 +306,6 @@ func (r *Repo) SetProviderStrategy(provider string, strat ProviderStrategy) erro
 	if strat.RotateStrategy != "" {
 		entry["rotateStrategy"] = strat.RotateStrategy
 		entry["fallbackStrategy"] = strat.RotateStrategy
-	}
-	// Pool rotation has its own key: sharing `rotateStrategy` made saving one
-	// rotation silently overwrite the other.
-	if strat.ProxyRotateStrategy != "" {
-		entry["proxyRotateStrategy"] = strat.ProxyRotateStrategy
 	}
 	if strat.StickyLimit > 0 {
 		entry["stickyLimit"] = strat.StickyLimit

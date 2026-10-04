@@ -214,48 +214,80 @@ func (r *Repo) ListProxyPools() ([]map[string]any, error) {
 	return list, nil
 }
 
-// ActivePoolIDs returns the ids of every active pool that carries a URL, in a
-// stable order. Proxy rotation picks from this list, so it is cached: the list
-// is read on the forwarding hot path and changes only when a pool is written.
-// Every mutation below drops the cache, so a stale entry cannot outlive a
-// change to the pool table.
+// ActivePoolIDs returns the ids of every active pool that carries a URL, in
+// creation order. Proxy rotation picks from this list, so it is cached: the
+// list is read on the forwarding hot path and changes only when a pool is
+// written. Every mutation below drops the cache, so a stale entry cannot
+// outlive a change to the pool table.
+//
+// The cache is per-Repo rather than package state because the answer belongs
+// to one database: two Repos over different handles would otherwise read each
+// other's pools.
 func (r *Repo) ActivePoolIDs() []string {
 	// A cached-but-nil pointer means invalidated: dereferencing it would panic,
 	// so both the empty list and the miss fall through to a fresh read.
 	if cached, ok := r.activePoolIDs.Load().(*[]string); ok && cached != nil {
 		return *cached
 	}
-	pools, err := r.ListProxyPools()
-	if err != nil {
-		return nil
-	}
-	ids := make([]string, 0, len(pools))
-	for _, p := range pools {
-		if active, _ := p["isActive"].(bool); !active {
-			continue
-		}
-		id, _ := p["id"].(string)
-		if id == "" || !proxyPoolRowHasURL(p) {
-			continue
-		}
-		ids = append(ids, id)
-	}
+	ids := r.queryActivePoolIDs()
 	r.activePoolIDs.Store(&ids)
 	return ids
 }
 
-// proxyPoolRowHasURL reports whether a pool row carries at least one URL. A
-// pool without one cannot serve a request, so rotation must not select it.
-func proxyPoolRowHasURL(p map[string]any) bool {
-	if s, _ := p["proxyUrl"].(string); strings.TrimSpace(s) != "" {
+// queryActivePoolIDs reads the candidate list straight from the table. The
+// filter runs in SQL and the payload decodes into a typed struct, so a database
+// holding many pools does not pay for rows rotation can never pick.
+func (r *Repo) queryActivePoolIDs() []string {
+	rows, err := r.db.Query(`SELECT id, data FROM proxyPools WHERE isActive = 1 ORDER BY createdAt`)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id, data string
+		if err := rows.Scan(&id, &data); err != nil {
+			continue
+		}
+		var payload struct {
+			ProxyURL string   `json:"proxyUrl"`
+			URLs     []string `json:"urls"`
+		}
+		if err := json.Unmarshal([]byte(data), &payload); err != nil {
+			continue
+		}
+		if poolPayloadHasURL(payload.ProxyURL, payload.URLs) {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
+// poolPayloadHasURL reports whether a pool carries at least one URL. A pool
+// without one cannot serve a request, so rotation must not select it — that
+// would hand a share of the traffic to a pool the resolver then refuses.
+func poolPayloadHasURL(proxyURL string, urls []string) bool {
+	if strings.TrimSpace(proxyURL) != "" {
 		return true
 	}
-	if urls, ok := p["urls"].([]any); ok {
-		for _, u := range urls {
-			if s, ok := u.(string); ok && strings.TrimSpace(s) != "" {
-				return true
-			}
+	for _, u := range urls {
+		if strings.TrimSpace(u) != "" {
+			return true
 		}
+	}
+	return false
+}
+
+// IsProxyPoolRotation reports whether a saved value means "rotate across the
+// active pools". Only the two values the provider card offers are accepted: it
+// writes exactly `round-robin` and `random`. `sticky` is deliberately not
+// accepted — it is a connection-rotation value, and taking it here used to
+// serve round-robin, promising an affinity this rotation does not keep.
+func IsProxyPoolRotation(s string) bool {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "round-robin", "roundrobin", "random":
+		return true
 	}
 	return false
 }

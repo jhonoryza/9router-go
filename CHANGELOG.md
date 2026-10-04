@@ -16,12 +16,16 @@ perilakunya.
 
 Perbaikan lanjutan dari review:
 
-- **Rotasi pool tidak lagi menyalakan rotasi koneksi.** Keduanya berbagi key
-  `rotateStrategy`, jadi menyimpan satu diam-diam mengaktifkan yang lain dan
-  akun ikut berganti padahal operator hanya meminta rotasi pool. Rotasi pool
-  kini memakai key `proxyRotateStrategy` sendiri; `rotateStrategy` tetap dibaca
-  sebagai fallback supaya assignment yang tersimpan oleh build lama tetap
-  berotasi.
+- **Rotasi pool tidak lagi menyalakan rotasi koneksi.** Kartu provider menyimpan
+  dua rotasi ke satu entri: blok `isNoAuth` menulis rotasi **pool** ke
+  `rotateStrategy`, tombol round-robin menulis rotasi **koneksi** ke
+  `fallbackStrategy`, dan keduanya dibaca ke field yang sama. Provider NoAuth
+  kini hanya mempercayai `fallbackStrategy` untuk rotasi koneksi, jadi memilih
+  rotasi pool tidak ikut membuat akun berganti.
+- **Rotasi pool hanya berlaku untuk provider NoAuth.** Itu persis di mana UI
+  menawarkannya. Di provider ber-API-key, `rotateStrategy` berisi rotasi akun,
+  dan menjadikannya steer egress akan mengirim trafik lewat pool yang tidak
+  pernah dikonfigurasi operatornya.
 - **Guard hapus pool menutup celah rotasi.** Rotasi memakai seluruh pool aktif,
   tapi `countProxyPoolBindings` hanya menghitung pool yang di-pin. Pool yang
   sedang melayani trafik rotasi bisa dihapus (200) di bawah request berikutnya;
@@ -31,11 +35,12 @@ Perbaikan lanjutan dari review:
   dilayani sebagai round-robin, padahal resolver ini tidak mengimplementasikan
   afinitas. UI hanya menawarkan round-robin dan random, jadi tidak ada yang
   kehilangan opsi.
-- **Counter rotasi per-provider.** Satu counter global membuat trafik satu
-  provider menggeser posisi provider lain.
-- **`ListProxyPools()` tidak lagi dipanggil di hot path.** Kandidat rotasi
-  disimpan di cache `db.ActivePoolIDs` dan di-invalidate di setiap mutasi
-  pool, sesuai AGENTS.md §4.A.
+- **Counter rotasi per-provider**, di-key dengan alias yang sudah di-resolve
+  supaya `oc` dan `opencode` berbagi kursor dan tidak saling melompati.
+- **`ListProxyPools()` tidak lagi dipanggil di hot path.** Kandidat rotasi dibaca
+  dengan query yang memfilter di SQL, disimpan di cache per-`Repo` (bukan state
+  paket, supaya dua `Repo` atas database berbeda tidak saling membaca pool),
+  dan di-invalidate di setiap mutasi pool — sesuai AGENTS.md §4.A.
 
 ### 📖 README: cara memakai database 9Router langsung, tanpa import
 

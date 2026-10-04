@@ -13,7 +13,6 @@ import (
 	"strings"
 	"time"
 
-	"9router/proxy/internal/db"
 	"9router/proxy/internal/handlerutil"
 	"9router/proxy/internal/log"
 	"9router/proxy/internal/providers"
@@ -80,20 +79,7 @@ func (h *ChatHandler) handleAccountFallback(
 	// Apply provider connection routing strategy (round-robin, sticky, random) if configured
 	if len(allConns) > 1 && h.Repo != nil {
 		if settings, sErr := h.Repo.GetSettings(); sErr == nil && settings != nil {
-			strat := db.ProviderStrategy{}
-			hasStrat := false
-			if settings.ProviderStrategies != nil {
-				if s, ok := settings.ProviderStrategies[provider]; ok {
-					strat = s
-					hasStrat = true
-				}
-			}
-			if !hasStrat || strat.RotateStrategy == "" {
-				if settings.FallbackStrategy != "" && settings.FallbackStrategy != "fill-first" {
-					strat.RotateStrategy = settings.FallbackStrategy
-					strat.StickyLimit = settings.StickyRoundRobinLimit
-				}
-			}
+			strat := connRotationStrategy(settings, provider)
 			if strat.RotateStrategy != "" && strat.RotateStrategy != "none" {
 				allConns = h.applyConnectionStrategy(allConns, strat)
 			}

@@ -6,27 +6,93 @@ import (
 	"9router/proxy/internal/db"
 )
 
-// Pool rotation and connection rotation are independent operators that used to
-// share the `rotateStrategy` key, so saving one silently armed the other. Each
-// case below pins one half of the separation: a client a consumer depends on.
-func TestProxyPoolRotation_DoesNotArmConnectionRotation(t *testing.T) {
+// poolRotationDB builds a repo holding an active pool, plus a settings row with
+// the given providerStrategies JSON.
+func poolRotationDB(t *testing.T, settingsJSON string) *db.Repo {
+	t.Helper()
 	database, cleanup := setupChatTestDB(t)
-	defer cleanup()
+	t.Cleanup(cleanup)
 
-	if _, err := database.Exec(`CREATE TABLE IF NOT EXISTS proxyPools (
-		id TEXT PRIMARY KEY,
-		isActive INTEGER DEFAULT 1,
-		testStatus TEXT,
-		data TEXT NOT NULL,
-		createdAt TEXT NOT NULL,
-		updatedAt TEXT NOT NULL
-	);`); err != nil {
-		t.Fatalf("create proxyPools: %v", err)
-	}
-	if _, err := database.Exec(`CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY, data TEXT);`); err != nil {
-		t.Fatalf("create settings: %v", err)
+	for _, ddl := range []string{
+		`CREATE TABLE IF NOT EXISTS proxyPools (
+			id TEXT PRIMARY KEY,
+			isActive INTEGER DEFAULT 1,
+			testStatus TEXT,
+			data TEXT NOT NULL,
+			createdAt TEXT NOT NULL,
+			updatedAt TEXT NOT NULL
+		);`,
+		`CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY, data TEXT);`,
+	} {
+		if _, err := database.Exec(ddl); err != nil {
+			t.Fatalf("create table: %v", err)
+		}
 	}
 
+	repo := db.NewRepo(database)
+	if _, err := database.Exec(`INSERT INTO settings (id, data) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET data = excluded.data`, settingsJSON); err != nil {
+		t.Fatalf("insert settings: %v", err)
+	}
+	return repo
+}
+
+// insertPools adds n active pools and returns their ids.
+func insertPools(t *testing.T, repo *db.Repo, n int) []string {
+	t.Helper()
+	ids := make([]string, 0, n)
+	for i := range n {
+		pool, err := repo.InsertProxyPool(db.ProxyPoolData{
+			Name: "pool-" + string(rune('a'+i)), ProxyURL: "http://172.17.0.1:8001", Type: "http",
+		})
+		if err != nil {
+			t.Fatalf("insert pool %d: %v", i, err)
+		}
+		ids = append(ids, pool["id"].(string))
+	}
+	return ids
+}
+
+// Pool rotation is offered only inside the provider card's `isNoAuth` block,
+// and that is where `rotateStrategy` means "rotate pools". On a keyed provider
+// the same key holds account rotation, so honouring it there would send the
+// provider's egress through pools its operator never configured.
+func TestProxyPoolRotation_OnlyAppliesToNoAuthProviders(t *testing.T) {
+	tests := []struct {
+		name     string
+		provider string
+		wantPool bool
+	}{
+		{"noauth provider rotates", "opencode", true},
+		{"keyed provider ignores it", "deepseek", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo := poolRotationDB(t, `{"providerStrategies":{
+				"opencode": {"rotateStrategy":"round-robin"},
+				"deepseek": {"rotateStrategy":"round-robin"}
+			}}`)
+			ids := insertPools(t, repo, 2)
+
+			got := NewChatHandler(repo).ResolveProviderProxyPoolID(tt.provider)
+			if tt.wantPool {
+				if got != ids[0] && got != ids[1] {
+					t.Fatalf("ResolveProviderProxyPoolID(%q) = %q, want one of the active pools", tt.provider, got)
+				}
+				return
+			}
+			if got != "" {
+				t.Fatalf("ResolveProviderProxyPoolID(%q) = %q, want empty: a keyed provider's rotateStrategy is account rotation", tt.provider, got)
+			}
+		})
+	}
+}
+
+// Rotating pools must not start rotating connections. Both land in the same
+// stored entry for a NoAuth provider, so the connection path has to read
+// `fallbackStrategy` only — otherwise the operator's pool choice silently
+// begins cycling their accounts.
+func TestProxyPoolRotation_DoesNotArmConnectionRotation(t *testing.T) {
 	tests := []struct {
 		name          string
 		settings      string
@@ -35,8 +101,14 @@ func TestProxyPoolRotation_DoesNotArmConnectionRotation(t *testing.T) {
 	}{
 		{
 			name:          "pool rotation alone leaves connection rotation off",
-			settings:      `{"providerStrategies":{"opencode":{"proxyRotateStrategy":"round-robin"}}}`,
+			settings:      `{"providerStrategies":{"opencode":{"rotateStrategy":"round-robin"}}}`,
 			wantConnRot:   "",
+			wantPoolCount: 1,
+		},
+		{
+			name:          "the two rotations are independent",
+			settings:      `{"providerStrategies":{"opencode":{"rotateStrategy":"round-robin","fallbackStrategy":"round-robin","stickyRoundRobinLimit":3}}}`,
+			wantConnRot:   "round-robin",
 			wantPoolCount: 1,
 		},
 		{
@@ -45,147 +117,40 @@ func TestProxyPoolRotation_DoesNotArmConnectionRotation(t *testing.T) {
 			wantConnRot:   "round-robin",
 			wantPoolCount: 0,
 		},
-		{
-			name:          "both can be set independently",
-			settings:      `{"providerStrategies":{"opencode":{"fallbackStrategy":"round-robin","proxyRotateStrategy":"random"}}}`,
-			wantConnRot:   "round-robin",
-			wantPoolCount: 1,
-		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			repo := db.NewRepo(database)
-			if _, err := repo.InsertProxyPool(db.ProxyPoolData{
-				Name: "warp", ProxyURL: "http://172.17.0.1:8001", Type: "http",
-			}); err != nil {
-				t.Fatalf("insert pool: %v", err)
-			}
-			if _, err := database.Exec(`INSERT INTO settings (id, data) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET data = excluded.data`, tt.settings); err != nil {
-				t.Fatalf("insert settings: %v", err)
-			}
+			repo := poolRotationDB(t, tt.settings)
+			insertPools(t, repo, 2)
 
+			h := NewChatHandler(repo)
+			got := h.ResolveProviderProxyPoolID("opencode")
+
+			// connRotationStrategy is what ApplyConnectionStrategy consumes: a
+			// non-empty RotateStrategy there is what makes accounts start cycling.
 			s, err := repo.GetSettings()
 			if err != nil {
 				t.Fatalf("GetSettings: %v", err)
 			}
-			strat := s.ProviderStrategies["opencode"]
-
-			// Connection rotation is what ApplyConnectionStrategy consumes; a
-			// non-empty value here is what makes accounts start cycling.
-			connArmed := strat.RotateStrategy != "" && strat.RotateStrategy != "none"
-			if connArmed != (tt.wantConnRot != "") {
-				t.Errorf("connection rotation armed = %v (RotateStrategy=%q), want %v",
-					connArmed, strat.RotateStrategy, tt.wantConnRot != "")
+			strat := connRotationStrategy(s, "opencode")
+			if strat.RotateStrategy != tt.wantConnRot {
+				t.Errorf("connection rotation = %q, want %q", strat.RotateStrategy, tt.wantConnRot)
 			}
 
-			h := NewChatHandler(repo)
-			got := h.ResolveProviderProxyPoolID("opencode")
 			poolCount := 0
 			if got != "" {
 				poolCount = 1
 			}
 			if poolCount != tt.wantPoolCount {
-				t.Errorf("pool rotation selected a pool = %v (id %q), want %v",
-					poolCount, got, tt.wantPoolCount)
+				t.Errorf("pool rotation selected a pool = %v (id %q), want %v", poolCount, got, tt.wantPoolCount)
 			}
 		})
 	}
 }
 
-// SetProviderStrategy held both rotations in one field, so the second write
-// overwrote the first and connection rotation could not survive alongside pool
-// rotation.
-func TestSetProviderStrategy_KeepsBothRotations(t *testing.T) {
-	database, cleanup := setupChatTestDB(t)
-	defer cleanup()
-
-	if _, err := database.Exec(`CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY, data TEXT);`); err != nil {
-		t.Fatalf("create settings: %v", err)
-	}
-	repo := db.NewRepo(database)
-
-	err := repo.SetProviderStrategy("opencode", db.ProviderStrategy{
-		RotateStrategy:      "round-robin",
-		StickyLimit:         3,
-		ProxyRotateStrategy: "random",
-	})
-	if err != nil {
-		t.Fatalf("SetProviderStrategy: %v", err)
-	}
-
-	s, err := repo.GetSettings()
-	if err != nil {
-		t.Fatalf("GetSettings: %v", err)
-	}
-	strat := s.ProviderStrategies["opencode"]
-
-	if strat.RotateStrategy != "round-robin" {
-		t.Errorf("connection rotation = %q, want round-robin", strat.RotateStrategy)
-	}
-	if strat.ProxyRotateStrategy != "random" {
-		t.Errorf("pool rotation = %q, want random", strat.ProxyRotateStrategy)
-	}
-	if strat.StickyLimit != 3 {
-		t.Errorf("sticky limit = %d, want 3", strat.StickyLimit)
-	}
-}
-
-// The dashboard wrote pool rotation to `rotateStrategy` before a dedicated key
-// existed. An operator who saved it that way must keep rotating rather than
-// silently fall back to one pool.
-func TestProxyPoolRotation_LegacyKeyStillRotates(t *testing.T) {
-	database, cleanup := setupChatTestDB(t)
-	defer cleanup()
-
-	if _, err := database.Exec(`CREATE TABLE IF NOT EXISTS proxyPools (
-		id TEXT PRIMARY KEY,
-		isActive INTEGER DEFAULT 1,
-		testStatus TEXT,
-		data TEXT NOT NULL,
-		createdAt TEXT NOT NULL,
-		updatedAt TEXT NOT NULL
-	);`); err != nil {
-		t.Fatalf("create proxyPools: %v", err)
-	}
-	if _, err := database.Exec(`CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY, data TEXT);`); err != nil {
-		t.Fatalf("create settings: %v", err)
-	}
-
-	repo := db.NewRepo(database)
-	ids := make([]string, 2)
-	for i, name := range []string{"warp", "warp 2"} {
-		pool, err := repo.InsertProxyPool(db.ProxyPoolData{
-			Name: name, ProxyURL: "http://172.17.0.1:8001", Type: "http",
-		})
-		if err != nil {
-			t.Fatalf("insert pool: %v", err)
-		}
-		ids[i] = pool["id"].(string)
-	}
-
-	legacy := `{"providerStrategies":{"opencode":{"rotateStrategy":"round-robin"}}}`
-	if _, err := database.Exec(`INSERT INTO settings (id, data) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET data = excluded.data`, legacy); err != nil {
-		t.Fatalf("insert settings: %v", err)
-	}
-
-	h := NewChatHandler(repo)
-	seen := map[string]int{}
-	for i := range 4 {
-		got := h.ResolveProviderProxyPoolID("opencode")
-		if got != ids[0] && got != ids[1] {
-			t.Fatalf("call %d: got %q, want one of the two active pools", i, got)
-		}
-		seen[got]++
-	}
-	if len(seen) != 2 {
-		t.Errorf("legacy pool rotation used %d of 2 pools, want both: %v", len(seen), seen)
-	}
-}
-
-// "sticky" was accepted as a pool rotation strategy and then served as
-// round-robin, promising affinity this resolver does not implement. It is a
-// connection-rotation value, so pool rotation must not take it.
+// `sticky` is a connection-rotation value. Pool rotation used to accept it and
+// serve round-robin, promising an affinity this resolver does not keep.
 func TestIsProxyPoolRotation_RejectsSticky(t *testing.T) {
 	tests := []struct {
 		value string
@@ -203,50 +168,22 @@ func TestIsProxyPoolRotation_RejectsSticky(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		if got := isProxyPoolRotation(tt.value); got != tt.want {
-			t.Errorf("isProxyPoolRotation(%q) = %v, want %v", tt.value, got, tt.want)
+		if got := db.IsProxyPoolRotation(tt.value); got != tt.want {
+			t.Errorf("IsProxyPoolRotation(%q) = %v, want %v", tt.value, got, tt.want)
 		}
 	}
 }
 
 // One shared cursor let one provider's traffic advance another's, so a provider
-// with a different pool count skipped positions.
+// rotating over a different number of pools skipped positions.
+//
+// This drives rotatedActiveProxyPool directly: opencode is currently the only
+// NoAuth chat provider, so the NoAuth gate would leave nothing to compare, and
+// the cursor is the unit under test here anyway.
 func TestPoolRotation_CursorsAreIndependentPerProvider(t *testing.T) {
-	database, cleanup := setupChatTestDB(t)
-	defer cleanup()
+	repo := poolRotationDB(t, `{}`)
+	ids := insertPools(t, repo, 3)
 
-	if _, err := database.Exec(`CREATE TABLE IF NOT EXISTS proxyPools (
-		id TEXT PRIMARY KEY,
-		isActive INTEGER DEFAULT 1,
-		testStatus TEXT,
-		data TEXT NOT NULL,
-		createdAt TEXT NOT NULL,
-		updatedAt TEXT NOT NULL
-	);`); err != nil {
-		t.Fatalf("create proxyPools: %v", err)
-	}
-	if _, err := database.Exec(`CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY, data TEXT);`); err != nil {
-		t.Fatalf("create settings: %v", err)
-	}
-
-	repo := db.NewRepo(database)
-	ids := make([]string, 3)
-	for i, name := range []string{"a", "b", "c"} {
-		pool, err := repo.InsertProxyPool(db.ProxyPoolData{
-			Name: name, ProxyURL: "http://172.17.0.1:8001", Type: "http",
-		})
-		if err != nil {
-			t.Fatalf("insert pool: %v", err)
-		}
-		ids[i] = pool["id"].(string)
-	}
-
-	settings := `{"providerStrategies":{"opencode":{"proxyRotateStrategy":"round-robin"},"cline":{"proxyRotateStrategy":"round-robin"}}}`
-	if _, err := database.Exec(`INSERT INTO settings (id, data) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET data = excluded.data`, settings); err != nil {
-		t.Fatalf("insert settings: %v", err)
-	}
-
-	h := NewChatHandler(repo)
 	pos := func(id string) int {
 		for i, v := range ids {
 			if v == id {
@@ -256,13 +193,14 @@ func TestPoolRotation_CursorsAreIndependentPerProvider(t *testing.T) {
 		return -1
 	}
 
-	// A full cycle must visit every pool. Which pool comes first depends on the
-	// query's ordering, so this asserts coverage, not a fixed starting pool.
-	for _, provider := range []string{"opencode", "cline"} {
+	h := NewChatHandler(repo)
+	// A full cycle must reach every pool. Which pool comes first depends on the
+	// query's ordering, so this asserts coverage rather than a fixed start.
+	for _, provider := range []string{"opencode", "blackbox"} {
 		seen := map[int]bool{}
 		var order []int
 		for range 3 {
-			order = append(order, pos(h.ResolveProviderProxyPoolID(provider)))
+			order = append(order, pos(h.rotatedActiveProxyPool(provider, "round-robin")))
 		}
 		for _, p := range order {
 			seen[p] = true
@@ -272,22 +210,44 @@ func TestPoolRotation_CursorsAreIndependentPerProvider(t *testing.T) {
 		}
 	}
 
-	// Interleaving another provider's traffic must not advance this provider's
-	// cursor. One cline request is enough to tell the two apart: with a shared
-	// counter it would shift opencode's next pick by one.
+	// Interleaving another provider's traffic must not advance this one's cursor.
+	// One blackbox request is enough to tell the two apart: a shared counter
+	// would shift opencode's next pick by one.
 	pick := func(provider string, n int) []string {
 		out := make([]string, 0, n)
 		for range n {
-			out = append(out, h.ResolveProviderProxyPoolID(provider))
+			out = append(out, h.rotatedActiveProxyPool(provider, "round-robin"))
 		}
 		return out
 	}
 	before := pick("opencode", 3)
-	_ = pick("cline", 1)
+	_ = pick("blackbox", 1)
 	after := pick("opencode", 3)
 	for i := range before {
 		if after[i] != before[i] {
-			t.Fatalf("cline's traffic moved opencode's cursor: %v became %v", before, after)
+			t.Fatalf("blackbox's traffic moved opencode's cursor: %v became %v", before, after)
 		}
+	}
+}
+
+// `oc` and `opencode` are one provider behind two names. They must share a
+// cursor, or a request arriving under either alias rotates independently and
+// the two skip each other.
+func TestPoolRotation_AliasesShareOneCursor(t *testing.T) {
+	repo := poolRotationDB(t, `{"providerStrategies":{"opencode":{"rotateStrategy":"round-robin"}}}`)
+	insertPools(t, repo, 3)
+
+	h := NewChatHandler(repo)
+	var order []string
+	for range 3 {
+		order = append(order, h.ResolveProviderProxyPoolID("oc"))
+	}
+
+	seen := map[string]bool{}
+	for _, id := range order {
+		seen[id] = true
+	}
+	if len(seen) != 3 {
+		t.Fatalf("alias rotation visited %d of 3 pools (%v), want all of them", len(seen), order)
 	}
 }

@@ -41,11 +41,18 @@ func TestProxyPoolBindings_RotationUsedPoolIsInUse(t *testing.T) {
 		t.Fatalf("insert rotated pool: %v", err)
 	}
 
-	if err := repo.SetProviderStrategy("opencode", db.ProviderStrategy{
-		ProxyPoolID:         pinned["id"].(string),
-		ProxyRotateStrategy: "round-robin",
+	// Pool rotation is derived from the `rotateStrategy` the provider card
+	// writes inside its NoAuth block, so seed that key rather than going
+	// through SetProviderStrategy, which persists connection rotation.
+	if err := repo.UpdateSettingsRaw(map[string]any{
+		"providerStrategies": map[string]any{
+			"opencode": map[string]any{
+				"rotateStrategy": "round-robin",
+				"proxyPoolId":    pinned["id"].(string),
+			},
+		},
 	}); err != nil {
-		t.Fatalf("set provider strategy: %v", err)
+		t.Fatalf("seed provider strategy: %v", err)
 	}
 
 	router := setupTestRouter(repo)
@@ -91,11 +98,17 @@ func TestProxyPoolBindings_PinnedAndRotatedCountsOnce(t *testing.T) {
 	}
 	poolID := pool["id"].(string)
 
-	if err := repo.SetProviderStrategy("opencode", db.ProviderStrategy{
-		ProxyPoolID:         poolID,
-		ProxyRotateStrategy: "round-robin",
+	// Seed the card's own key: rotation is derived from `rotateStrategy`, which
+	// SetProviderStrategy does not write as a pool rotation.
+	if err := repo.UpdateSettingsRaw(map[string]any{
+		"providerStrategies": map[string]any{
+			"opencode": map[string]any{
+				"rotateStrategy": "round-robin",
+				"proxyPoolId":    poolID,
+			},
+		},
 	}); err != nil {
-		t.Fatalf("set provider strategy: %v", err)
+		t.Fatalf("seed provider strategy: %v", err)
 	}
 
 	req := httptest.NewRequest(http.MethodGet, "/api/proxy-pools?includeUsage=true", nil)

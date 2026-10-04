@@ -11,6 +11,7 @@ import (
 
 	"9router/proxy/internal/db"
 	"9router/proxy/internal/handlerutil"
+	"9router/proxy/internal/providers"
 )
 
 // countProxyPoolBindings counts, per pool, what still points at it. A pool is
@@ -46,8 +47,11 @@ func (h *DashboardHandler) countProxyPoolBindings() map[string]int {
 		return boundCounts
 	}
 	rotating := false
-	for _, strat := range settings.ProviderStrategies {
-		if isPoolRotationStrategy(strat.ProxyRotateStrategy) {
+	for provider, strat := range settings.ProviderStrategies {
+		// Same gate the chat path applies: only a NoAuth provider's
+		// `rotateStrategy` means pool rotation, so counting rotation usage for
+		// a keyed provider would refuse deletion of pools nobody rotates over.
+		if db.IsProxyPoolRotation(strat.ProxyRotateStrategy) && providers.IsNoAuthProvider(provider) {
 			rotating = true
 		}
 		if strat.ProxyPoolID != "" && strat.ProxyPoolID != "__none__" {

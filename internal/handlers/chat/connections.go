@@ -41,31 +41,22 @@ func (h *ChatHandler) ResolveProviderProxyPoolID(provider string) string {
 			if singleID == "" && strat.ProxyPoolID != "" && strat.ProxyPoolID != "__none__" {
 				singleID = strat.ProxyPoolID
 			}
-			if rotate == "" && isProxyPoolRotation(strat.ProxyRotateStrategy) {
+			if rotate == "" && db.IsProxyPoolRotation(strat.ProxyRotateStrategy) {
 				rotate = strat.ProxyRotateStrategy
 			}
 		}
 	}
-	if rotate != "" {
+	// Pool rotation is a NoAuth-provider feature: the provider card offers it
+	// only inside its `isNoAuth` block, and there `rotateStrategy` holds a POOL
+	// rotation. On a keyed provider the same key holds ACCOUNT rotation, so
+	// honouring it here would send that provider's egress through pools its
+	// operator never configured.
+	if rotate != "" && providers.IsNoAuthProvider(provider) {
 		if id := h.rotatedActiveProxyPool(provider, rotate); id != "" {
 			return id
 		}
 	}
 	return singleID
-}
-
-// isProxyPoolRotation reports whether a saved strategy means "rotate across the
-// active pools". Only the two values the dashboard offers are accepted: the
-// provider card writes exactly `round-robin` and `random`. `sticky` is
-// deliberately not accepted — it reads as a connection-rotation value and used
-// to be silently served as round-robin, which is a promise this code does not
-// keep.
-func isProxyPoolRotation(s string) bool {
-	switch strings.ToLower(strings.TrimSpace(s)) {
-	case "round-robin", "roundrobin", "random":
-		return true
-	}
-	return false
 }
 
 // poolRotationCursors holds one round-robin cursor per provider. A single
@@ -91,7 +82,9 @@ func (h *ChatHandler) rotatedActiveProxyPool(provider, strategy string) string {
 	if strings.ToLower(strings.TrimSpace(strategy)) == "random" {
 		return ids[rand.IntN(len(ids))]
 	}
-	cursor, _ := poolRotationCursors.LoadOrStore(provider, new(atomic.Uint64))
+	// Keyed on the resolved alias so `oc` and `opencode` share one cursor: they
+	// are the same provider and must advance together.
+	cursor, _ := poolRotationCursors.LoadOrStore(providers.ResolveAlias(provider), new(atomic.Uint64))
 	idx := cursor.(*atomic.Uint64).Add(1) - 1
 	return ids[idx%uint64(len(ids))]
 }
@@ -122,6 +115,35 @@ func providerStrategyKeys(provider string) []string {
 		add(providers.GetProviderAlias(counterpart))
 	}
 	return keys
+}
+
+// connRotationStrategy resolves which connection-rotation strategy applies to a
+// provider, for the code paths that rotate accounts.
+//
+// A NoAuth provider is the case that needs care: its card writes pool rotation
+// to `rotateStrategy` and account rotation to `fallbackStrategy`, and both land
+// in the same stored entry. Reading RotateStrategy there would let the operator
+// rotate pools and silently start rotating connections too, so for those
+// providers only `fallbackStrategy` is trusted. Keyed providers keep the
+// original read, where `rotateStrategy` genuinely is the connection strategy.
+func connRotationStrategy(settings *db.SettingsData, provider string) db.ProviderStrategy {
+	strat := db.ProviderStrategy{}
+	hasStrat := false
+	if settings != nil && settings.ProviderStrategies != nil {
+		if s, ok := settings.ProviderStrategies[provider]; ok {
+			strat, hasStrat = s, true
+		}
+	}
+	if providers.IsNoAuthProvider(provider) {
+		strat.RotateStrategy = strat.ConnRotateStrategy
+	}
+	if settings != nil && (!hasStrat || strat.RotateStrategy == "") {
+		if settings.FallbackStrategy != "" && settings.FallbackStrategy != "fill-first" {
+			strat.RotateStrategy = settings.FallbackStrategy
+			strat.StickyLimit = settings.StickyRoundRobinLimit
+		}
+	}
+	return strat
 }
 
 // proxyPoolCounterpart returns the provider that shares a pool with this one
@@ -232,20 +254,7 @@ func (h *ChatHandler) getBestConnection(provider string, connectionID string, ex
 
 		// Rotate only connections eligible for the requested model.
 		if len(connections) > 1 && settingsErr == nil && settings != nil {
-			strat := db.ProviderStrategy{}
-			hasStrat := false
-			if settings.ProviderStrategies != nil {
-				if s, ok := settings.ProviderStrategies[provider]; ok {
-					strat = s
-					hasStrat = true
-				}
-			}
-			if !hasStrat || strat.RotateStrategy == "" {
-				if settings.FallbackStrategy != "" && settings.FallbackStrategy != "fill-first" {
-					strat.RotateStrategy = settings.FallbackStrategy
-					strat.StickyLimit = settings.StickyRoundRobinLimit
-				}
-			}
+			strat := connRotationStrategy(settings, provider)
 			if strat.RotateStrategy != "" && strat.RotateStrategy != "none" {
 				connections = h.applyConnectionStrategy(connections, strat)
 			}
