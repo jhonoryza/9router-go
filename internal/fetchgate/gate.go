@@ -30,6 +30,16 @@ type Gate struct {
 	next      time.Time
 	minGap    time.Duration
 	maxJitter time.Duration
+
+	// onGrant, when set, is called with the instant each slot was handed out,
+	// in the order slots were handed out. It exists so tests can assert the
+	// gate's pacing on the instants it actually granted rather than on when a
+	// caller goroutine happened to be scheduled afterwards — the second is a
+	// property of the OS scheduler, and on a loaded -race run it varies by tens
+	// of milliseconds, which makes a test of minGap report failures the gate
+	// never committed. Tests set this before the first Acquire; production
+	// leaves it nil and pays one nil check per grant.
+	onGrant func(start time.Time)
 }
 
 // New returns a gate that spaces consecutive slots by at least minGap, plus a
@@ -75,6 +85,9 @@ func (g *Gate) reserve() (start, now time.Time) {
 	start = now
 	if g.next.After(start) {
 		start = g.next
+	}
+	if g.onGrant != nil {
+		g.onGrant(start)
 	}
 	g.next = start.Add(g.minGap + g.jitter())
 	return start, now

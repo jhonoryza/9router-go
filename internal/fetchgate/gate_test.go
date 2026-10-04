@@ -3,7 +3,6 @@ package fetchgate
 import (
 	"context"
 	"errors"
-	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -25,6 +24,12 @@ func TestGateAcquire_IdleGateReturnsImmediately(t *testing.T) {
 
 // The whole point of the gate: N simultaneous callers must not start in the
 // same millisecond. This is the ten-accounts-on-one-IP case from issue #30.
+//
+// The gap is judged on the instants the gate granted, not on when each caller
+// goroutine was scheduled after Acquire returned. A caller's return time also
+// carries OS scheduler delay, which on a loaded -race run overshoots the grant
+// by tens of milliseconds and reports a pacing failure the gate never
+// committed.
 func TestGateAcquire_SpacesConcurrentCallers(t *testing.T) {
 	const (
 		callers = 8
@@ -33,52 +38,84 @@ func TestGateAcquire_SpacesConcurrentCallers(t *testing.T) {
 	g := New(minGap, 0)
 
 	var (
-		mu    sync.Mutex
-		slots []time.Duration
-		wg    sync.WaitGroup
+		mu      sync.Mutex
+		granted []time.Time
 	)
-	start := time.Now()
+	g.onGrant = func(start time.Time) {
+		mu.Lock()
+		granted = append(granted, start)
+		mu.Unlock()
+	}
+
+	var wg sync.WaitGroup
 	for range callers {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			if err := g.Acquire(t.Context()); err != nil {
 				t.Errorf("Acquire: %v", err)
-				return
 			}
-			mu.Lock()
-			slots = append(slots, time.Since(start))
-			mu.Unlock()
 		}()
 	}
 	wg.Wait()
 
-	if len(slots) != callers {
-		t.Fatalf("got %d slots, want %d", len(slots), callers)
+	mu.Lock()
+	seq := append([]time.Time(nil), granted...)
+	mu.Unlock()
+
+	if len(seq) != callers {
+		t.Fatalf("got %d slots, want %d", len(seq), callers)
 	}
-	sort.Slice(slots, func(i, j int) bool { return slots[i] < slots[j] })
-	for i := 1; i < len(slots); i++ {
-		// Sorted by start time, so consecutive entries are consecutive grants.
-		if gap := slots[i] - slots[i-1]; gap < minGap*9/10 {
-			t.Errorf("caller %d started %s after the previous one, want >= %s", i, gap, minGap)
+	// onGrant runs inside reserve() in reservation order, so seq is already the
+	// order the gate handed the slots out.
+	for i := 1; i < len(seq); i++ {
+		if gap := seq[i].Sub(seq[i-1]); gap < minGap {
+			t.Errorf("caller %d was granted %s after the previous one, want >= %s", i, gap, minGap)
 		}
 	}
 }
 
 // Jitter must only ever add delay: the floor stays the hard guarantee.
+//
+// Judged on granted instants, same as the spacing test above, and with a gap
+// wide enough to stay clear of scheduler noise. A caller-side stopwatch here
+// has no margin at all: jitter is drawn from [0, maxJitter], so a 30ms floor
+// can legitimately be followed by a zero-jitter slot and the next grant is due
+// exactly 30ms out, leaving nothing to absorb a late goroutine wake-up.
 func TestGateAcquire_JitterOnlyWidensTheGap(t *testing.T) {
-	g := New(30*time.Millisecond, 30*time.Millisecond)
+	const (
+		minGap = 40 * time.Millisecond
+		jitter = 60 * time.Millisecond
+	)
+	g := New(minGap, jitter)
 
-	if err := g.Acquire(t.Context()); err != nil {
-		t.Fatalf("first Acquire: %v", err)
+	var (
+		mu      sync.Mutex
+		granted []time.Time
+	)
+	g.onGrant = func(start time.Time) {
+		mu.Lock()
+		granted = append(granted, start)
+		mu.Unlock()
 	}
-	for i := range 5 {
-		start := time.Now()
+
+	const slots = 6
+	for range slots {
 		if err := g.Acquire(t.Context()); err != nil {
-			t.Fatalf("Acquire %d: %v", i, err)
+			t.Fatalf("Acquire: %v", err)
 		}
-		if elapsed := time.Since(start); elapsed < 30*time.Millisecond {
-			t.Fatalf("slot %d waited %s, want at least the 30ms floor", i, elapsed)
+	}
+
+	mu.Lock()
+	seq := append([]time.Time(nil), granted...)
+	mu.Unlock()
+
+	if len(seq) != slots {
+		t.Fatalf("got %d slots, want %d", len(seq), slots)
+	}
+	for i := 1; i < len(seq); i++ {
+		if gap := seq[i].Sub(seq[i-1]); gap < minGap {
+			t.Errorf("slot %d was granted %s after the previous one, want >= %s", i, gap, minGap)
 		}
 	}
 }

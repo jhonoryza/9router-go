@@ -1,6 +1,65 @@
 # Changelog
 
 ## [Unreleased]
+### 🩹 Test live upstream dipisah dari CI lewat opt-in eksplisit
+
+19 test di `internal/handlers/chat/` memanggil provider sungguhan dengan
+kredensial asli dari `~/.9router/db/data.sqlite`, dan semuanya ikut
+`go test ./...` yang dijalankan CI. Modelnya free-tier dan dipakai bersama:
+`oc/space-bunny-free` dan `muse-spark-*-contributor-free` membatasi rate per IP
+dan sering sudah habis dipakai pengguna lain. Akibatnya `space-bunny-free`
+gagal di `go test -race ./...` dengan `upstream error: Forward...` — kegagalan
+yang sama sekali tidak ada hubungannya dengan gateway ini. Yang lebih buruk,
+tanpa kredensial CI test itu akan "lolos" sambil tidak membuktikan apa pun.
+
+Sekarang kelas test dibedakan oleh opt-in `9ROUTER_LIVE_TESTS=1`, bukan oleh
+skip per-status. Gerbangnya `requireLiveUpstream`, dipanggil di dalam
+`getRealUserDB` yang sudah dilewati setiap test live — sehingga test live baru
+yang lupa memasang gerbang tetap skip, bukan bocor ke CI. Lima test
+`muse_spark_*` tidak lewat `getRealUserDB` (koneksi opencode-nya tidak di-seed,
+jadi modelnya resolve langsung ke provider) dan memasang gerbangnya sendiri.
+`make test-live` adalah pembungkus untuk menjalankannya lokal.
+
+Sembilan pola `if rec.Code == http.StatusTooManyRequests || ...` yang ditulis
+ulang bergantian per test kini satu helper `requireLiveOK`/`requireLiveSSE`, dan
+`upstreamUnavailable` dilebarkan ke 429/403/402/502/503/504 — status yang berarti
+"belum sekarang", bukan cacat gateway. Setiap skip membawa body jawaban
+provider, jadi run lokal tetap memberi tahu apa sebenarnya yang upstream said.
+400 dan 500 tetap gagal, karena itu kesalahan gateway. 401 sengaja dipisah: itu
+masalah profil lokal, bukan pemadaman provider.
+
+### 🩹 Tes pacing `fetchgate` diukur pada slot yang benar-benar diberikan gate
+
+`TestGateAcquire_SpacesConcurrentCallers` dan
+`TestGateAcquire_JitterOnlyWidensTheGap` mengukur `time.Since(start)` di dalam
+goroutine pemanggil, lalu mengurutkan ulang hasil pembacaan itu. Yang diukur
+bukan kapan slot diberikan, melainkan kapan goroutine yang barusan dialokasikan
+OS berhasil acquiring mutex — sebuah sifat penjadwalan, bukan sifat gate.
+Ketika `-race` menjalankan 39 package paralel, penundaan penjadwalan bisa
+mengganggu gap 40ms sampai ~20ms, sehingga tes melaporkan kegagalan pacing yang
+gate tidak pernah komiting: di run yang sama, gap pemanggil pendek di 8 dari 40
+run sementara urutan grant gate bersih seluruhnya.
+
+`Gate` kini punya hook `onGrant`, dipanggil di dalam `reserve()` dengan
+instan setiap slot yang diberikan, dan kedua tes menilai jarak pada urutan
+grant itu. Hook-nya `nil` di produksi — satu cek nil per grant. Ambang
+`minGap` sendiri tidak dilonggarkan, jadi pagar terhadap issue #30 (sepuluh
+akun satu IP memicu 429 lalu akun terkunci) tetap seketat semula.
+
+`JitterOnlyWidensTheGap` juga dibuat punya margin: sebelumnya `New(30ms, 30ms)`
+beri slot pertama tepat 30ms dengan jitter yang sah bernilai 0, jadi tidak
+sisa untuk menyerap bangunnya goroutine yang terlambat. Sekarang minGap 40ms
+dengan jitter 60ms.
+
+**Verifikasi:** kedua tes tetap menangkap regresi — `minGap/2` disuntik ke
+`reserve()` membuat keduanya gagal deterministik dengan laporan gap 20ms, lalu
+dikembalikan. `go test -race -count=40 -run TestGateAcquire ./internal/fetchgate/`
+bersih. Tanpa opt-in, `go test ./...` hijau dan 19 test live skip; dengan opt-in
+mereka berjalan ke provider asli dan yang punya koneksi konfigurasi hijau —
+Antigravity chat/stream/tool-call/quota, Gemini 3.8, dan `space-bunny-free`
+menjawab 200 dengan content asli. DeepSeek dan Cline skip karena tidak ada
+koneksinya di profil. Nol baris logika produksi tersentuh selain hook `onGrant`.
+
 ### 🩹 Pembacaan usage yang gagal diam-diam dilaporkan sebagai nol — dashboard Usage & Analytics
 
 `GetUsageDailyRecent`, `GetUsageHistorySince`, `GetRecentUsageHistory`,
