@@ -13,6 +13,10 @@ import (
 	"9router/proxy/internal/handlerutil"
 )
 
+// countProxyPoolBindings counts, per pool, what still points at it. A pool is
+// in use by a connection that pins it, by a provider strategy that pins it, or
+// by any provider rotating across the active pools — the last case covers every
+// pool rotation would pick, so none of them can be deleted underneath it.
 func (h *DashboardHandler) countProxyPoolBindings() map[string]int {
 	boundCounts := make(map[string]int)
 	conns, _ := h.Repo.GetProviderConnections("", false)
@@ -34,16 +38,45 @@ func (h *DashboardHandler) countProxyPoolBindings() map[string]int {
 			boundCounts[poolID]++
 		}
 	}
-	if h.Repo != nil {
-		if settings, err := h.Repo.GetSettings(); err == nil && settings != nil {
-			for _, strat := range settings.ProviderStrategies {
-				if strat.ProxyPoolID != "" && strat.ProxyPoolID != "__none__" {
-					boundCounts[strat.ProxyPoolID]++
-				}
+	if h.Repo == nil {
+		return boundCounts
+	}
+	settings, err := h.Repo.GetSettings()
+	if err != nil || settings == nil {
+		return boundCounts
+	}
+	rotating := false
+	for _, strat := range settings.ProviderStrategies {
+		if isPoolRotationStrategy(strat.ProxyRotateStrategy) {
+			rotating = true
+		}
+		if strat.ProxyPoolID != "" && strat.ProxyPoolID != "__none__" {
+			boundCounts[strat.ProxyPoolID]++
+		}
+	}
+	if rotating {
+		// Rotation draws from every active pool, so each one counts as in use —
+		// but only when nothing else already counts it. A pinned pool must not
+		// read as two bindings, and a provider rotating over the pool it also
+		// pins is still one binding.
+		for _, id := range h.Repo.ActivePoolIDs() {
+			if boundCounts[id] == 0 {
+				boundCounts[id] = 1
 			}
 		}
 	}
 	return boundCounts
+}
+
+// isPoolRotationStrategy mirrors the accepted pool-rotation values in the chat
+// package. Kept as a literal list rather than shared so the dashboard does not
+// import the handler it serves.
+func isPoolRotationStrategy(s string) bool {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "round-robin", "roundrobin", "random":
+		return true
+	}
+	return false
 }
 
 // HandleGetProxyPools handles GET /api/proxy-pools.

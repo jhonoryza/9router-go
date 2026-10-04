@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"sync/atomic"
 
 	"9router/proxy/internal/models"
 )
@@ -14,6 +15,11 @@ import (
 // Repo wraps the SQLite handle and groups all persistence queries.
 type Repo struct {
 	db *sql.DB
+
+	// activePoolIDs caches ActivePoolIDs. It lives on the Repo rather than in
+	// package state because the answer belongs to one database: two Repos over
+	// different handles would otherwise read each other's pool list.
+	activePoolIDs atomic.Value // *[]string
 }
 
 // NewRepo creates a new repository instance using the provided SQL database connection.

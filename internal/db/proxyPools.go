@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	json "encoding/json/v2"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -45,6 +46,13 @@ func (p *ProxyPool) IsEdgeRelay() bool {
 }
 
 var proxyPoolCache sync.Map // map[string]*ProxyPool
+
+// invalidateActivePoolIDs drops this Repo's rotation candidate cache. It
+// stores a typed nil pointer rather than a nil slice: a nil slice asserts to
+// []string successfully, which would leave the cache permanently empty.
+func (r *Repo) invalidateActivePoolIDs() {
+	r.activePoolIDs.Store((*[]string)(nil))
+}
 
 // GetProxyPool reads a proxy pool from the proxyPools table.
 func (r *Repo) GetProxyPool(poolID string) (*ProxyPool, error) {
@@ -148,6 +156,7 @@ func (r *Repo) InsertProxyPool(d ProxyPoolData) (map[string]any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("insert proxy pool: %w", err)
 	}
+	r.invalidateActivePoolIDs()
 	return map[string]any{
 		"id":           id,
 		"name":         d.Name,
@@ -205,10 +214,57 @@ func (r *Repo) ListProxyPools() ([]map[string]any, error) {
 	return list, nil
 }
 
+// ActivePoolIDs returns the ids of every active pool that carries a URL, in a
+// stable order. Proxy rotation picks from this list, so it is cached: the list
+// is read on the forwarding hot path and changes only when a pool is written.
+// Every mutation below drops the cache, so a stale entry cannot outlive a
+// change to the pool table.
+func (r *Repo) ActivePoolIDs() []string {
+	// A cached-but-nil pointer means invalidated: dereferencing it would panic,
+	// so both the empty list and the miss fall through to a fresh read.
+	if cached, ok := r.activePoolIDs.Load().(*[]string); ok && cached != nil {
+		return *cached
+	}
+	pools, err := r.ListProxyPools()
+	if err != nil {
+		return nil
+	}
+	ids := make([]string, 0, len(pools))
+	for _, p := range pools {
+		if active, _ := p["isActive"].(bool); !active {
+			continue
+		}
+		id, _ := p["id"].(string)
+		if id == "" || !proxyPoolRowHasURL(p) {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	r.activePoolIDs.Store(&ids)
+	return ids
+}
+
+// proxyPoolRowHasURL reports whether a pool row carries at least one URL. A
+// pool without one cannot serve a request, so rotation must not select it.
+func proxyPoolRowHasURL(p map[string]any) bool {
+	if s, _ := p["proxyUrl"].(string); strings.TrimSpace(s) != "" {
+		return true
+	}
+	if urls, ok := p["urls"].([]any); ok {
+		for _, u := range urls {
+			if s, ok := u.(string); ok && strings.TrimSpace(s) != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // DeleteProxyPool removes a proxy pool by id.
 func (r *Repo) DeleteProxyPool(id string) error {
 	_, err := r.db.Exec(`DELETE FROM proxyPools WHERE id = ?`, id)
 	proxyPoolCache.Delete(id)
+	r.invalidateActivePoolIDs()
 	return err
 }
 
@@ -248,6 +304,7 @@ func (r *Repo) UpdateProxyPool(id string, updates map[string]any) error {
 	_, err = r.db.Exec(`UPDATE proxyPools SET data = ?, isActive = ?, testStatus = ?, updatedAt = ? WHERE id = ?`,
 		string(updatedBytes), isActive, testStatus, now, id)
 	proxyPoolCache.Delete(id)
+	r.invalidateActivePoolIDs()
 	return err
 }
 

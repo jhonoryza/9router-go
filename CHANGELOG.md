@@ -1,6 +1,42 @@
 # Changelog
 
 ## [Unreleased]
+### 🩹 Rotasi proxy pool opencode: rotasi yang benar-benar lewat proxy
+
+Pada provider opencode, memilih rotasi (round-robin/random) tidak memakai pool
+warp yang sudah dipasang — request tetap jalan direct. Kolom egress di usage
+juga selalu menulis "direct" untuk request yang sebenarnya lewat proxy HTTP,
+dan kolom "bound" di halaman proxy-pools selalu 0 untuk pool yang dipasang
+level provider karena hanya koneksi yang dihitung.
+
+Sekarang rotasi memutar request ke seluruh pool aktif, kolom egress menampilkan
+nama pool, dan kolom bound menghitung pemasangan level provider. Rotasi hanya
+berlaku untuk pengaturan rotasi proxy; rotasi round-robin koneksi tidak berubah
+perilakunya.
+
+Perbaikan lanjutan dari review:
+
+- **Rotasi pool tidak lagi menyalakan rotasi koneksi.** Keduanya berbagi key
+  `rotateStrategy`, jadi menyimpan satu diam-diam mengaktifkan yang lain dan
+  akun ikut berganti padahal operator hanya meminta rotasi pool. Rotasi pool
+  kini memakai key `proxyRotateStrategy` sendiri; `rotateStrategy` tetap dibaca
+  sebagai fallback supaya assignment yang tersimpan oleh build lama tetap
+  berotasi.
+- **Guard hapus pool menutup celah rotasi.** Rotasi memakai seluruh pool aktif,
+  tapi `countProxyPoolBindings` hanya menghitung pool yang di-pin. Pool yang
+  sedang melayani trafik rotasi bisa dihapus (200) di bawah request berikutnya;
+  sekarang ditolak 409. Pool yang di-pin sekaligus dipakai rotasi tetap
+  dihitung satu binding, bukan dua.
+- **`sticky` ditolak sebagai strategi rotasi pool.** Nilai ini diterima lalu
+  dilayani sebagai round-robin, padahal resolver ini tidak mengimplementasikan
+  afinitas. UI hanya menawarkan round-robin dan random, jadi tidak ada yang
+  kehilangan opsi.
+- **Counter rotasi per-provider.** Satu counter global membuat trafik satu
+  provider menggeser posisi provider lain.
+- **`ListProxyPools()` tidak lagi dipanggil di hot path.** Kandidat rotasi
+  disimpan di cache `db.ActivePoolIDs` dan di-invalidate di setiap mutasi
+  pool, sesuai AGENTS.md §4.A.
+
 ### 📖 README: cara memakai database 9Router langsung, tanpa import
 
 Pertanyaan yang paling sering masuk — "bisa nggak import dari 9router?" — sudah

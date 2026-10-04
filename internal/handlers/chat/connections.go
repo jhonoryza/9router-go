@@ -6,6 +6,7 @@ import (
 	"math/rand/v2"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -46,64 +47,53 @@ func (h *ChatHandler) ResolveProviderProxyPoolID(provider string) string {
 		}
 	}
 	if rotate != "" {
-		if id := h.rotatedActiveProxyPool(rotate); id != "" {
+		if id := h.rotatedActiveProxyPool(provider, rotate); id != "" {
 			return id
 		}
 	}
 	return singleID
 }
 
+// isProxyPoolRotation reports whether a saved strategy means "rotate across the
+// active pools". Only the two values the dashboard offers are accepted: the
+// provider card writes exactly `round-robin` and `random`. `sticky` is
+// deliberately not accepted — it reads as a connection-rotation value and used
+// to be silently served as round-robin, which is a promise this code does not
+// keep.
 func isProxyPoolRotation(s string) bool {
 	switch strings.ToLower(strings.TrimSpace(s)) {
-	case "round-robin", "roundrobin", "sticky", "random":
+	case "round-robin", "roundrobin", "random":
 		return true
 	}
 	return false
 }
 
-var providerPoolRotation uint64
+// poolRotationCursors holds one round-robin cursor per provider. A single
+// shared counter let one provider's traffic advance another's, so a provider
+// with a different number of active pools skipped positions.
+var poolRotationCursors sync.Map // map[string]*atomic.Uint64
 
-func (h *ChatHandler) rotatedActiveProxyPool(strategy string) string {
+// rotatedActiveProxyPool picks the next pool for a provider under a rotation
+// strategy. The cursor is that provider's own round-robin position, so two
+// providers rotating at once advance independently.
+//
+// A pool with no URL is excluded upstream: it cannot serve a request, and
+// selecting it would hand a share of the traffic to a pool the resolver then
+// refuses.
+func (h *ChatHandler) rotatedActiveProxyPool(provider, strategy string) string {
 	if h.Repo == nil {
 		return ""
 	}
-	pools, err := h.Repo.ListProxyPools()
-	if err != nil {
-		return ""
-	}
-	var ids []string
-	for _, p := range pools {
-		if active, _ := p["isActive"].(bool); !active {
-			continue
-		}
-		id, _ := p["id"].(string)
-		if id == "" || !proxyPoolRowHasURL(p) {
-			continue
-		}
-		ids = append(ids, id)
-	}
+	ids := h.Repo.ActivePoolIDs()
 	if len(ids) == 0 {
 		return ""
 	}
 	if strings.ToLower(strings.TrimSpace(strategy)) == "random" {
 		return ids[rand.IntN(len(ids))]
 	}
-	idx := atomic.AddUint64(&providerPoolRotation, 1)
+	cursor, _ := poolRotationCursors.LoadOrStore(provider, new(atomic.Uint64))
+	idx := cursor.(*atomic.Uint64).Add(1) - 1
 	return ids[idx%uint64(len(ids))]
-}
-
-func proxyPoolRowHasURL(p map[string]any) bool {
-	if s, _ := p["proxyUrl"].(string); strings.TrimSpace(s) != "" {
-		return true
-	}
-	if urls, ok := p["urls"].([]any); ok {
-		for _, u := range urls {
-			if s, ok := u.(string); ok && strings.TrimSpace(s) != "" {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 // providerStrategyKeys lists the settings keys a provider's pool may be stored
