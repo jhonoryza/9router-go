@@ -6,6 +6,7 @@ import (
 	"math/rand/v2"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"9router/proxy/internal/constants"
@@ -25,12 +26,6 @@ var CredentialFallbacks = map[string]string{
 	"clinepass":     "cline",
 }
 
-// ResolveProviderProxyPoolID returns the active proxy pool ID configured for a
-// provider. The dashboard writes a provider-level pool under the provider's
-// short alias (ProviderDetailView's storageAlias) while requests arrive
-// carrying the canonical id, so both keys are checked — in the shape upstream
-// resolves them (src/shared/constants/providers.js), not a hand-written pair
-// list, which is how an assignment could be shown in the UI yet read as none.
 func (h *ChatHandler) ResolveProviderProxyPoolID(provider string) string {
 	if h.Repo == nil {
 		return ""
@@ -39,14 +34,76 @@ func (h *ChatHandler) ResolveProviderProxyPoolID(provider string) string {
 	if err != nil || settings == nil || settings.ProviderStrategies == nil {
 		return ""
 	}
+	var singleID, rotate string
 	for _, p := range providerStrategyKeys(provider) {
 		if strat, ok := settings.ProviderStrategies[p]; ok {
-			if strat.ProxyPoolID != "" && strat.ProxyPoolID != "__none__" {
-				return strat.ProxyPoolID
+			if singleID == "" && strat.ProxyPoolID != "" && strat.ProxyPoolID != "__none__" {
+				singleID = strat.ProxyPoolID
+			}
+			if rotate == "" && isProxyPoolRotation(strat.ProxyRotateStrategy) {
+				rotate = strat.ProxyRotateStrategy
 			}
 		}
 	}
-	return ""
+	if rotate != "" {
+		if id := h.rotatedActiveProxyPool(rotate); id != "" {
+			return id
+		}
+	}
+	return singleID
+}
+
+func isProxyPoolRotation(s string) bool {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "round-robin", "roundrobin", "sticky", "random":
+		return true
+	}
+	return false
+}
+
+var providerPoolRotation uint64
+
+func (h *ChatHandler) rotatedActiveProxyPool(strategy string) string {
+	if h.Repo == nil {
+		return ""
+	}
+	pools, err := h.Repo.ListProxyPools()
+	if err != nil {
+		return ""
+	}
+	var ids []string
+	for _, p := range pools {
+		if active, _ := p["isActive"].(bool); !active {
+			continue
+		}
+		id, _ := p["id"].(string)
+		if id == "" || !proxyPoolRowHasURL(p) {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	if len(ids) == 0 {
+		return ""
+	}
+	if strings.ToLower(strings.TrimSpace(strategy)) == "random" {
+		return ids[rand.IntN(len(ids))]
+	}
+	idx := atomic.AddUint64(&providerPoolRotation, 1)
+	return ids[idx%uint64(len(ids))]
+}
+
+func proxyPoolRowHasURL(p map[string]any) bool {
+	if s, _ := p["proxyUrl"].(string); strings.TrimSpace(s) != "" {
+		return true
+	}
+	if urls, ok := p["urls"].([]any); ok {
+		for _, u := range urls {
+			if s, ok := u.(string); ok && strings.TrimSpace(s) != "" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // providerStrategyKeys lists the settings keys a provider's pool may be stored

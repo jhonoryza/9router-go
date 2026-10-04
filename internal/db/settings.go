@@ -19,6 +19,7 @@ type ProviderStrategy struct {
 	RotateStrategy        string `json:"rotateStrategy,omitempty"` // "none", "round-robin", "random", "sticky"
 	StickyLimit           int    `json:"stickyLimit,omitempty"`
 	StrictModelAssignment bool   `json:"strictModelAssignment,omitempty"`
+	ProxyRotateStrategy   string `json:"proxyRotateStrategy,omitempty"`
 }
 
 // CapacityAdapterEntry defines settings for an input-modality capability adapter pool.
@@ -44,7 +45,7 @@ type SettingsData struct {
 	AutoUpdate                 bool                            `json:"autoUpdate"`
 	FallbackStrategy           string                          `json:"fallbackStrategy,omitempty"`
 	StickyRoundRobinLimit      int                             `json:"stickyRoundRobinLimit,omitempty"`
-	ForceFallback             bool                            `json:"forceFallback,omitempty"`
+	ForceFallback              bool                            `json:"forceFallback,omitempty"`
 	ComboStrategy              string                          `json:"comboStrategy,omitempty"`
 	ComboStickyRoundRobinLimit int                             `json:"comboStickyRoundRobinLimit,omitempty"`
 	ComboStrategies            map[string]ComboStrategy        `json:"comboStrategies,omitempty"`
@@ -187,9 +188,10 @@ func (r *Repo) GetSettings() (*SettingsData, error) {
 					sticky = int(sl)
 				}
 				strat := ProviderStrategy{
-					ProxyPoolID:    handlerutil.GetString(vm, "proxyPoolId"),
-					RotateStrategy: rotateStrat,
-					StickyLimit:    sticky,
+					ProxyPoolID:         handlerutil.GetString(vm, "proxyPoolId"),
+					RotateStrategy:      rotateStrat,
+					StickyLimit:         sticky,
+					ProxyRotateStrategy: handlerutil.GetString(vm, "rotateStrategy"),
 				}
 				if sma, ok := vm["strictModelAssignment"].(bool); ok {
 					strat.StrictModelAssignment = sma
@@ -283,6 +285,9 @@ func (r *Repo) SetProviderStrategy(provider string, strat ProviderStrategy) erro
 	if strat.RotateStrategy != "" {
 		entry["rotateStrategy"] = strat.RotateStrategy
 		entry["fallbackStrategy"] = strat.RotateStrategy
+	}
+	if strat.ProxyRotateStrategy != "" {
+		entry["rotateStrategy"] = strat.ProxyRotateStrategy
 	}
 	if strat.StickyLimit > 0 {
 		entry["stickyLimit"] = strat.StickyLimit

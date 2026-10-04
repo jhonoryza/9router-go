@@ -13,8 +13,6 @@ import (
 	"9router/proxy/internal/handlerutil"
 )
 
-// countProxyPoolBindings counts provider connections bound to the given pool,
-// checking both the top-level proxyPoolId and providerSpecificData.proxyPoolId.
 func (h *DashboardHandler) countProxyPoolBindings() map[string]int {
 	boundCounts := make(map[string]int)
 	conns, _ := h.Repo.GetProviderConnections("", false)
@@ -34,6 +32,15 @@ func (h *DashboardHandler) countProxyPoolBindings() map[string]int {
 		}
 		if poolID != "" {
 			boundCounts[poolID]++
+		}
+	}
+	if h.Repo != nil {
+		if settings, err := h.Repo.GetSettings(); err == nil && settings != nil {
+			for _, strat := range settings.ProviderStrategies {
+				if strat.ProxyPoolID != "" && strat.ProxyPoolID != "__none__" {
+					boundCounts[strat.ProxyPoolID]++
+				}
+			}
 		}
 	}
 	return boundCounts
