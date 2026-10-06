@@ -4,6 +4,7 @@ import (
 	"context"
 	"regexp"
 	"strings"
+	"sync"
 
 	json "encoding/json/v2"
 
@@ -72,18 +73,37 @@ var (
 	imageIDHint     = regexp.MustCompile(`(?i)image|imagen|dall-?e|flux|sdxl|sd-|stable-diffusion`)
 )
 
-// isLLMModelID mirrors upstream inferKindFromUnknownModelId.
+var llmModelIDCache = struct {
+	sync.RWMutex
+	m   map[string]bool
+	max int
+}{m: make(map[string]bool), max: 20000}
+
 func isLLMModelID(modelID string) bool {
+	llmModelIDCache.RLock()
+	if v, ok := llmModelIDCache.m[modelID]; ok {
+		llmModelIDCache.RUnlock()
+		return v
+	}
+	llmModelIDCache.RUnlock()
+	var v bool
 	switch {
 	case embeddingIDHint.MatchString(modelID):
-		return false
+		v = false
 	case ttsIDHint.MatchString(modelID):
-		return false
+		v = false
 	case imageIDHint.MatchString(modelID):
-		return false
+		v = false
 	default:
-		return true
+		v = true
 	}
+	llmModelIDCache.Lock()
+	if len(llmModelIDCache.m) >= llmModelIDCache.max {
+		llmModelIDCache.m = make(map[string]bool, llmModelIDCache.max)
+	}
+	llmModelIDCache.m[modelID] = v
+	llmModelIDCache.Unlock()
+	return v
 }
 
 // isLLMModelEntry resolves one merged id to its service kind the way upstream
@@ -989,7 +1009,7 @@ func (h *ChatHandler) appendCombos(data []ModelInfoObject, seen map[string]bool)
 			Object:  "model",
 			OwnedBy: "combo",
 		}
-		if caps, ok := h.aggregateComboCapabilities(combo.Name); ok {
+		if caps, ok := h.aggregateComboCapabilities(combo); ok {
 			entry.Capabilities = caps
 		}
 		// Upstream publishes the combo-wide limits at the top level too (any
@@ -1007,10 +1027,8 @@ func (h *ChatHandler) appendCombos(data []ModelInfoObject, seen map[string]bool)
 // aggregateComboCapabilities folds the leaf capabilities with upstream's
 // aggregateComboCapabilities rules (`some` for most booleans, `every` for
 // tools, first-leaf thinking fields, narrowest contextWindow, widest
-// maxOutput) and returns the combo-specific shape.
-func (h *ChatHandler) aggregateComboCapabilities(comboName string) (*providers.ComboCapabilities, bool) {
-	combo, err := h.Repo.GetComboByName(comboName)
-	if err != nil || combo == nil || combo.Models == "" {
+func (h *ChatHandler) aggregateComboCapabilities(combo *models.Combo) (*providers.ComboCapabilities, bool) {
+	if combo == nil || combo.Models == "" {
 		return nil, false
 	}
 	var leaves []string

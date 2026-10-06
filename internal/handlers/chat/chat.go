@@ -438,13 +438,16 @@ func queryFlagEnabled(v string) bool {
 func (h *ChatHandler) HandleModels(w http.ResponseWriter, r *http.Request) {
 	mode := modelsListModeFromQuery(r)
 	result := h.buildModelsListResult(r.Context(), mode)
-	handlerutil.WriteJSON(w, http.StatusOK, map[string]any{
+	modelsJSON, err := json.Marshal(result.Models)
+	if err != nil {
+		handlerutil.WriteJSONError(w, http.StatusInternalServerError, "failed to encode models")
+		return
+	}
+	handlerutil.WriteModelsList(w, http.StatusOK, map[string]any{
 		"object":      "list",
-		"data":        result.Models,
-		"models":      result.Models,
 		"mode":        result.Mode,
 		"connections": result.Connections,
-	})
+	}, modelsJSON)
 }
 
 // HandleModelsInfo returns metadata for a specific model.

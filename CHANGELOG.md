@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### ⚡ `GET /v1/models` lebih cepat saat provider & model banyak
+
+Build daftar model di endpoint ini CPU-bound per model, bukan DB-bound. Empat hal diubah, tanpa mengubah perilaku:
+
+- `isLLMModelID` (3 regex per model tak dikenal) dan `GetModelTokenLimits` (switch `strings.Contains` raksasa) kini di-cache per id. Keduanya punya batas ukuran (20k entri, di-reset saat penuh) dan ikut dibersihkan `InvalidateCapabilitiesCache`.
+- 113 pola kapabilitas diindeks: fragmen literal tiap glob dihitung sekali di `initPatternIndex`, lalu pencocokan disaring dengan `strings.Contains` dan hanya kandidat yang diverifikasi `path.Match`. Urutan first-match-wins tetap.
+- `aggregateComboCapabilities` memakai row combo yang sudah dimuat `GetCombos()`, bukan query ulang per combo.
+- `HandleModels` men-marshal daftar model sekali dan menulis envelope-nya langsung lewat `WriteModelsList`, jadi list besar tidak di-encode dua kali untuk key `data` dan `models`. Envelope meta tetap memakai `deterministicJSON` sehingga urutan key stabil antar-request.
+
+**Verifikasi (host sama, id sintetik worst-case):** build warm 28→6 ms (20 koneksi × 75 model) dan 64→15 ms (50 × 75); build cold 512→76 ms dan 1254→175 ms; end-to-end 46→16 ms dan 105→39 ms. Suite: test baru untuk identitas `data`/`models`, stabilitas urutan key, reuse row combo, guard tabel pola, dan ekuivalensi indeks pola atas seluruh id registry; benchmark untuk `HandleModels` dan jalur pola.
+
 ## [v1.9.10-exp.1] - 2026-10-06
 
 ### 🐛 Tombol Test di halaman media provider salah probe — model System One selalu 500
