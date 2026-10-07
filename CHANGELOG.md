@@ -1,6 +1,25 @@
 # Changelog
 
 ## [Unreleased]
+### 🐛 `opencode-zen`/deepseek: body request di-serialize acak — prompt cache miss di tiap request
+
+Rantai rewrite lane zen/deepseek (`InjectReasoningContent` →
+`ConcealFingerprintTools` → stamping `stream`/`model`) melewati
+unmarshal → mutasi → marshal pada map generik. `encoding/json/v2`
+mengacak urutan member map di setiap marshal, sehingga request yang
+logikanya identik menghasilkan byte body yang berbeda tiap kali —
+terukur 195 dari 200 request menghasilkan body berbeda. Cache prompt
+DeepSeek berbasis prefix byte, jadi setiap request setelah yang pertama
+membayar full cache miss meski percakapan berjalan di sesi yang sama.
+
+Semua titik marshal pada rantai rewrite itu kini memakai
+`json.Deterministic(true)` (`marshalStable` di executor, opsi sama di
+translator fingerprint): urutan member map menjadi sorted dan stabil,
+prefix request antar-turn konsisten, dan prompt cache upstream bisa hit.
+Diukur via `TestZenRewriteChainDeterministic` (integration): 200 request
+identik → tepat 1 bentuk body (sebelumnya ~195 bentuk).
+
+### 🐛 `internal/fetchgate` flaky di `go test -p 16` — gap diukur salah
 
 ### 💀 A retired model fails the request instead of the combo — HTTP 410 now fails over and is badged
 
