@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 
@@ -18,8 +19,8 @@ func deepseekBody(turns int) []byte {
 	var b strings.Builder
 	b.WriteString(`{"model":"deepseek-v4-pro","messages":[{"role":"user","content":"sys"}`)
 	for i := 0; i < turns; i++ {
-		b.WriteString(`,{"role":"assistant","content":"a` + string(rune('0'+i)) + `"}`)
-		b.WriteString(`,{"role":"user","content":"u` + string(rune('0'+i)) + `"}`)
+		b.WriteString(`,{"role":"assistant","content":"a` + strconv.Itoa(i) + `"}`)
+		b.WriteString(`,{"role":"user","content":"u` + strconv.Itoa(i) + `"}`)
 	}
 	b.WriteString(`]}`)
 	return []byte(b.String())
