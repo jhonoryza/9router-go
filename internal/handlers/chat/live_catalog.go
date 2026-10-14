@@ -90,73 +90,35 @@ var liveCatalogStore = struct {
 // node) before the first result populates the cache.
 var liveCatalogFlight singleflight.Group
 
-// resolveLiveCatalog returns the live catalog for a provider connection, or nil
-// when the provider has no live resolver or discovery failed. Callers fall back
-// to the static registry, exactly like upstream's `live?.models?.length` guard.
+// resolveLiveCatalog returns the live catalog for a provider connection from
+// the cache layers ONLY — the in-memory store, then the KV copy written by the
+// last refresh (dashboard sync or the daily background job). It NEVER fetches:
+// a slow or dead provider must not stall /v1/models, which previously waited
+// out the full 30s kiro timeout on every request after the 5-minute cache
+// expired. A provider whose catalog has never been refreshed falls back to
+// the static registry in the caller.
+//
+// Deliberate divergence from upstream (LIVE_MODEL_RESOLVERS in
+// src/app/api/v1/models/route.js), which fetches in the request path: this
+// build moves discovery to POST /api/models/live-catalog/refresh and
+// StartBackgroundLiveCatalogRefresh.
 func (h *ChatHandler) resolveLiveCatalog(ctx context.Context, conn *models.ProviderConnection, connData *shared.ConnectionData, providerID string) []LiveModel {
 	if conn == nil || connData == nil {
 		return nil
 	}
-	accessToken := connData.AccessToken
-	if accessToken == "" {
-		accessToken = connData.APIKey
-	}
-	if accessToken == "" {
+	if !hasLiveCatalogResolver(providerID) {
 		return nil
 	}
-
-	var fetch func(context.Context, string) []LiveModel
-	switch {
-	case providerID == "kiro":
-		fetch = func(ctx context.Context, token string) []LiveModel {
-			return h.fetchKiroLiveCatalog(ctx, conn, connData, token)
-		}
-	case providerID == "grok-cli":
-		fetch = func(ctx context.Context, token string) []LiveModel {
-			return h.fetchGrokCLILiveCatalog(ctx, conn, connData, token)
-		}
-	case isCompatibleProviderID(providerID):
-		// Upstream fetchCompatibleModelIds: custom nodes publish whatever their
-		// own /models endpoint reports.
-		fetch = func(ctx context.Context, _ string) []LiveModel {
-			return h.fetchCompatibleNodeModels(ctx, conn, connData, providerID)
-		}
-	default:
-		return nil
-	}
-
 	cacheKey := liveCatalogKey(providerID, conn, connData)
 	if cached, ok := liveCatalogCached(cacheKey); ok {
 		return cached
 	}
-
-	// One upstream call per credential even when many requests race a cold
-	// cache: the losers wait for the winner's result instead of each fanning
-	// out to the provider API.
-	result, err, _ := liveCatalogFlight.Do(cacheKey, func() (any, error) {
-		if cached, ok := liveCatalogCached(cacheKey); ok {
-			return cached, nil
-		}
-		discovered := fetch(ctx, accessToken)
-		if len(discovered) == 0 && liveCatalogRefreshToken(conn) != "" {
-			// Upstream refreshes the credential on 401/403 and retries once.
-			if refreshed, _, rErr := h.forceRefreshOAuthToken(conn.ID); rErr == nil && refreshed != "" {
-				discovered = fetch(ctx, refreshed)
-			} else if rErr != nil {
-				log.Warn("models", "live catalog token refresh failed", "provider", providerID, "conn", conn.ID, "error", rErr)
-			}
-		}
-		if len(discovered) == 0 {
-			return nil, nil
-		}
-		liveCatalogStoreModels(cacheKey, discovered)
-		return discovered, nil
-	})
-	if err != nil || result == nil {
+	persisted := h.loadPersistedLiveCatalog(conn.ID)
+	if len(persisted) == 0 {
 		return nil
 	}
-	discovered, _ := result.([]LiveModel)
-	return discovered
+	liveCatalogStoreModels(cacheKey, persisted)
+	return persisted
 }
 
 func liveCatalogKey(providerID string, conn *models.ProviderConnection, connData *shared.ConnectionData) string {

@@ -1,6 +1,7 @@
 package chat
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -29,60 +30,126 @@ func resetLiveCatalog(t *testing.T) {
 	})
 }
 
-// TestHandleModels_KiroLiveCatalogReplacesStatic proves the live catalog wins
-// over the static registry — that is what makes upstream publish `kr/auto`
-// instead of the 44 registry entries.
-func TestHandleModels_KiroLiveCatalogReplacesStatic(t *testing.T) {
-	resetLiveCatalog(t)
-
-	var gotPath, gotAuth, gotFingerprint string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotPath = r.URL.Path
-		gotAuth = r.Header.Get("Authorization")
-		gotFingerprint = r.Header.Get("User-Agent")
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"models":[{"modelId":"auto","modelName":"Auto","rateMultiplier":1,"tokenLimits":{"maxInputTokens":300000}},{"modelId":"claude-sonnet-4","modelName":"Sonnet 4","rateMultiplier":1}]}`))
-	}))
-	defer srv.Close()
-	kiroCatalogBaseURL = srv.URL + "/%s"
-
+// seedLiveConn inserts one active provider connection and returns a handler
+// whose Repo points at the seeded database.
+func seedLiveConn(t *testing.T, id, provider, connData string, client *http.Client) *ChatHandler {
+	t.Helper()
 	database, cleanup := setupChatTestDB(t)
-	defer cleanup()
+	t.Cleanup(cleanup)
 	if _, err := database.Exec(`DELETE FROM providerConnections`); err != nil {
 		t.Fatalf("delete connections: %v", err)
 	}
 	if _, err := database.Exec(`DELETE FROM kv WHERE scope='customModels'`); err != nil {
 		t.Fatalf("delete customs: %v", err)
 	}
-	connData := `{"accessToken":"ya29.kiro-test","providerSpecificData":{"profileArn":"arn:aws:codewhisperer:eu-west-1:123456789012:profile/ABC"}}`
+	if _, err := database.Exec(`DELETE FROM kv WHERE scope='liveCatalogs'`); err != nil {
+		t.Fatalf("delete liveCatalogs: %v", err)
+	}
 	if _, err := database.Exec(`INSERT INTO providerConnections (id, provider, authType, name, priority, isActive, data, createdAt, updatedAt) VALUES
-		('conn-kiro-live', 'kiro', 'oauth', 'Kiro Live', 1, 1, ?, '2026-07-18T00:00:00Z', '2026-07-18T00:00:00Z')`, connData); err != nil {
-		t.Fatalf("seed kiro: %v", err)
+		(?, ?, 'oauth', ?, 1, 1, ?, '2026-07-18T00:00:00Z', '2026-07-18T00:00:00Z')`, id, provider, provider, connData); err != nil {
+		t.Fatalf("seed %s: %v", provider, err)
+	}
+	h := NewChatHandler(db.NewRepo(database))
+	if client != nil {
+		h.Client = client
+	}
+	return h
+}
+
+// TestHandleModels_CacheOnlyAfterRefresh proves the new flow: a refresh
+// fetches and persists, then /v1/models serves the persisted list without any
+// network call — even on a fresh handler (simulating a restart).
+func TestHandleModels_CacheOnlyAfterRefresh(t *testing.T) {
+	resetLiveCatalog(t)
+
+	var fetches atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fetches.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"models":[{"modelId":"auto","modelName":"Auto","rateMultiplier":1,"tokenLimits":{"maxInputTokens":300000}},{"modelId":"claude-sonnet-4","modelName":"Sonnet 4","rateMultiplier":1}]}`))
+	}))
+	defer srv.Close()
+	kiroCatalogBaseURL = srv.URL + "/%s"
+
+	h := seedLiveConn(t, "conn-kiro-live", "kiro",
+		`{"accessToken":"ya29.kiro-test","providerSpecificData":{"profileArn":"arn:aws:codewhisperer:eu-west-1:123456789012:profile/ABC"}}`,
+		srv.Client())
+
+	refreshed, failed, _, err := h.RefreshLiveCatalogs(context.Background(), "kiro")
+	if err != nil || refreshed != 1 || failed != 0 {
+		t.Fatalf("refresh = (%d, %d, %v), want (1, 0, nil)", refreshed, failed, err)
+	}
+	if fetches.Load() != 1 {
+		t.Fatalf("expected 1 upstream fetch during refresh, got %d", fetches.Load())
 	}
 
-	h := NewChatHandler(db.NewRepo(database))
-	h.Client = srv.Client()
-	ids := modelsIDs(t, h)
-	joined := strings.Join(ids, "\n")
-
+	// A brand-new handler with a cold in-memory cache — the restart case —
+	// still answers from the persisted KV copy.
+	fresh := NewChatHandler(h.Repo)
+	joined := strings.Join(modelsIDs(t, fresh), "\n")
 	if !strings.Contains(joined, "kr/auto") || !strings.Contains(joined, "kr/auto-thinking") {
-		t.Errorf("live catalog models missing, got:\n%s", joined)
+		t.Errorf("persisted live catalog models missing, got:\n%s", joined)
 	}
 	if !strings.Contains(joined, "kr/claude-sonnet-4-agentic") {
 		t.Errorf("kiro agentic variant missing, got:\n%s", joined)
 	}
-	// Static-only entries must disappear once the live catalog takes over.
 	if strings.Contains(joined, "kr/claude-opus-5") {
 		t.Errorf("static registry entry leaked next to a live catalog, got:\n%s", joined)
 	}
-	if gotAuth != "Bearer ya29.kiro-test" {
-		t.Errorf("expected bearer token, got %q", gotAuth)
+	if n := fetches.Load(); n != 1 {
+		t.Errorf("/v1/models must never fetch, expected still 1 upstream fetch, got %d", n)
 	}
-	if !strings.Contains(gotFingerprint, "KiroIDE-") {
-		t.Errorf("expected Kiro IDE fingerprint UA, got %q", gotFingerprint)
+}
+
+// The request path must not reach the network even when nothing has ever been
+// refreshed: a dead upstream cannot stall /v1/models (the regression this
+// redesign fixes — previously every request waited out the 30s kiro timeout).
+func TestHandleModels_NeverFetchesOnRequest(t *testing.T) {
+	resetLiveCatalog(t)
+
+	var fetches atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fetches.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"models":[{"modelId":"auto"}]}`))
+	}))
+	defer srv.Close()
+	kiroCatalogBaseURL = srv.URL + "/%s"
+
+	h := seedLiveConn(t, "conn-kiro-nofetch", "kiro",
+		`{"accessToken":"ya29.kiro-test"}`, srv.Client())
+
+	joined := strings.Join(modelsIDs(t, h), "\n")
+	if fetches.Load() != 0 {
+		t.Errorf("/v1/models fetched the live catalog %d times; it must answer from cache only", fetches.Load())
 	}
-	if !strings.Contains(gotPath, "eu-west-1") {
-		t.Errorf("expected region from profileArn in path, got %q", gotPath)
+	// Without a persisted catalog the static registry is the fallback.
+	if !strings.Contains(joined, "kr/claude-opus-5") {
+		t.Errorf("static catalog must be served when nothing has been refreshed, got:\n%s", joined)
+	}
+}
+
+// A failed refresh must not poison anything: /v1/models falls back to the
+// static registry until a refresh succeeds.
+func TestRefreshLiveCatalogs_FailureKeepsStaticFallback(t *testing.T) {
+	resetLiveCatalog(t)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+	kiroCatalogBaseURL = srv.URL + "/%s"
+
+	h := seedLiveConn(t, "conn-kiro-dead", "kiro",
+		`{"accessToken":"ya29.dead"}`, srv.Client())
+
+	refreshed, failed, _, _ := h.RefreshLiveCatalogs(context.Background(), "kiro")
+	if refreshed != 0 || failed != 1 {
+		t.Fatalf("refresh = (%d, %d), want (0, 1)", refreshed, failed)
+	}
+	joined := strings.Join(modelsIDs(t, h), "\n")
+	if !strings.Contains(joined, "kr/claude-opus-5") {
+		t.Errorf("static catalog must be used when the refresh failed, got:\n%s", joined)
 	}
 }
 
@@ -99,22 +166,9 @@ func TestHandleModels_EnabledModelsSkipLiveCatalog(t *testing.T) {
 	defer srv.Close()
 	kiroCatalogBaseURL = srv.URL + "/%s"
 
-	database, cleanup := setupChatTestDB(t)
-	defer cleanup()
-	if _, err := database.Exec(`DELETE FROM providerConnections`); err != nil {
-		t.Fatalf("delete connections: %v", err)
-	}
-	if _, err := database.Exec(`DELETE FROM kv WHERE scope='customModels'`); err != nil {
-		t.Fatalf("delete customs: %v", err)
-	}
-	connData := `{"accessToken":"ya29.kiro-test","providerSpecificData":{"enabledModels":["pinned-model"]}}`
-	if _, err := database.Exec(`INSERT INTO providerConnections (id, provider, authType, name, priority, isActive, data, createdAt, updatedAt) VALUES
-		('conn-kiro-pinned', 'kiro', 'oauth', 'Kiro Pinned', 1, 1, ?, '2026-07-18T00:00:00Z', '2026-07-18T00:00:00Z')`, connData); err != nil {
-		t.Fatalf("seed kiro: %v", err)
-	}
+	h := seedLiveConn(t, "conn-kiro-pinned", "kiro",
+		`{"accessToken":"ya29.kiro-test","providerSpecificData":{"enabledModels":["pinned-model"]}}`, srv.Client())
 
-	h := NewChatHandler(db.NewRepo(database))
-	h.Client = srv.Client()
 	joined := strings.Join(modelsIDs(t, h), "\n")
 
 	if called {
@@ -125,40 +179,8 @@ func TestHandleModels_EnabledModelsSkipLiveCatalog(t *testing.T) {
 	}
 }
 
-// A live catalog failure must fall back to the static registry, never to an
-// empty provider.
-func TestHandleModels_LiveCatalogFailureFallsBackToStatic(t *testing.T) {
-	resetLiveCatalog(t)
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusUnauthorized)
-	}))
-	defer srv.Close()
-	kiroCatalogBaseURL = srv.URL + "/%s"
-
-	database, cleanup := setupChatTestDB(t)
-	defer cleanup()
-	if _, err := database.Exec(`DELETE FROM providerConnections`); err != nil {
-		t.Fatalf("delete connections: %v", err)
-	}
-	if _, err := database.Exec(`DELETE FROM kv WHERE scope='customModels'`); err != nil {
-		t.Fatalf("delete customs: %v", err)
-	}
-	if _, err := database.Exec(`INSERT INTO providerConnections (id, provider, authType, name, priority, isActive, data, createdAt, updatedAt) VALUES
-		('conn-kiro-dead', 'kiro', 'oauth', 'Kiro Dead', 1, 1, '{"accessToken":"ya29.dead"}', '2026-07-18T00:00:00Z', '2026-07-18T00:00:00Z')`); err != nil {
-		t.Fatalf("seed kiro: %v", err)
-	}
-
-	h := NewChatHandler(db.NewRepo(database))
-	h.Client = srv.Client()
-	joined := strings.Join(modelsIDs(t, h), "\n")
-	if !strings.Contains(joined, "kr/claude-opus-5") {
-		t.Errorf("static catalog must be used when the live catalog fails, got:\n%s", joined)
-	}
-}
-
 // Grok CLI publishes only what the account may use.
-func TestHandleModels_GrokCLILiveCatalog(t *testing.T) {
+func TestRefreshLiveCatalogs_GrokCLI(t *testing.T) {
 	resetLiveCatalog(t)
 
 	var gotHeaders http.Header
@@ -170,24 +192,14 @@ func TestHandleModels_GrokCLILiveCatalog(t *testing.T) {
 	defer srv.Close()
 	grokCLICatalogURL = srv.URL + "/v1/models"
 
-	database, cleanup := setupChatTestDB(t)
-	defer cleanup()
-	if _, err := database.Exec(`DELETE FROM providerConnections`); err != nil {
-		t.Fatalf("delete connections: %v", err)
-	}
-	if _, err := database.Exec(`DELETE FROM kv WHERE scope='customModels'`); err != nil {
-		t.Fatalf("delete customs: %v", err)
-	}
-	connData := `{"accessToken":"xai-test-token","providerSpecificData":{"email":"dev@example.com"}}`
-	if _, err := database.Exec(`INSERT INTO providerConnections (id, provider, authType, name, priority, isActive, data, createdAt, updatedAt) VALUES
-		('conn-grok-live', 'grok-cli', 'oauth', 'Grok Live', 1, 1, ?, '2026-07-18T00:00:00Z', '2026-07-18T00:00:00Z')`, connData); err != nil {
-		t.Fatalf("seed grok-cli: %v", err)
-	}
+	h := seedLiveConn(t, "conn-grok-live", "grok-cli",
+		`{"accessToken":"xai-test-token","providerSpecificData":{"email":"dev@example.com"}}`, srv.Client())
 
-	h := NewChatHandler(db.NewRepo(database))
-	h.Client = srv.Client()
+	refreshed, failed, _, _ := h.RefreshLiveCatalogs(context.Background(), "grok-cli")
+	if refreshed != 1 || failed != 0 {
+		t.Fatalf("refresh = (%d, %d), want (1, 0)", refreshed, failed)
+	}
 	joined := strings.Join(modelsIDs(t, h), "\n")
-
 	if !strings.Contains(joined, "gcli/grok-4.7") {
 		t.Errorf("live grok model missing, got:\n%s", joined)
 	}
@@ -202,59 +214,51 @@ func TestHandleModels_GrokCLILiveCatalog(t *testing.T) {
 	}
 }
 
-// Concurrency guard: a cold cache must not fan out once per request. Ten
-// simultaneous /v1/models calls have to collapse into a single upstream fetch.
-func TestHandleModels_LiveCatalogCoalescesConcurrentRequests(t *testing.T) {
+// Providers without a live resolver are skipped, not counted as failures.
+func TestRefreshLiveCatalogs_SkipsProvidersWithoutResolver(t *testing.T) {
 	resetLiveCatalog(t)
 
-	var hits atomic.Int64
-	release := make(chan struct{})
+	h := seedLiveConn(t, "conn-deepseek", "deepseek", `{"apiKey":"sk-x"}`, nil)
+	refreshed, failed, skipped, _ := h.RefreshLiveCatalogs(context.Background(), "")
+	if refreshed != 0 || failed != 0 || skipped != 1 {
+		t.Fatalf("refresh = (%d, %d, %d), want (0, 0, 1)", refreshed, failed, skipped)
+	}
+}
+
+// A refresh still coalesces: one connection refreshes exactly once regardless
+// of how many refresh calls race (kv write idempotent, cache overwrite fine).
+func TestRefreshLiveCatalogs_PersistsForRestart(t *testing.T) {
+	resetLiveCatalog(t)
+
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hits.Add(1)
-		<-release // hold the first fetch so every caller piles up behind it
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{"models":[{"modelId":"auto"}]}`))
 	}))
 	defer srv.Close()
 	kiroCatalogBaseURL = srv.URL + "/%s"
 
-	database, cleanup := setupChatTestDB(t)
-	defer cleanup()
-	if _, err := database.Exec(`DELETE FROM providerConnections`); err != nil {
-		t.Fatalf("delete connections: %v", err)
-	}
-	if _, err := database.Exec(`DELETE FROM kv WHERE scope='customModels'`); err != nil {
-		t.Fatalf("delete customs: %v", err)
-	}
-	if _, err := database.Exec(`INSERT INTO providerConnections (id, provider, authType, name, priority, isActive, data, createdAt, updatedAt) VALUES
-		('conn-kiro-storm', 'kiro', 'oauth', 'Kiro Storm', 1, 1, '{"accessToken":"ya29.storm"}', '2026-07-18T00:00:00Z', '2026-07-18T00:00:00Z')`); err != nil {
-		t.Fatalf("seed kiro: %v", err)
+	h := seedLiveConn(t, "conn-kiro-persist", "kiro", `{"accessToken":"ya29.kiro-persist"}`, srv.Client())
+	if _, failed, _, _ := h.RefreshLiveCatalogs(context.Background(), "kiro"); failed != 0 {
+		t.Fatal("refresh failed")
 	}
 
-	h := NewChatHandler(db.NewRepo(database))
-	h.Client = srv.Client()
-
-	const callers = 10
-	ids := make(chan []string, callers)
-	for i := 0; i < callers; i++ {
-		go func() {
-			req := httptest.NewRequest("GET", "/v1/models", nil)
-			rec := httptest.NewRecorder()
-			h.HandleModels(rec, req)
-			ids <- modelsIDsFromBody(rec.Body.Bytes())
-		}()
+	kv, err := h.Repo.GetKVScope("liveCatalogs")
+	if err != nil {
+		t.Fatalf("kv scope: %v", err)
 	}
-	// Let every goroutine reach the resolver before the single fetch completes.
-	time.Sleep(150 * time.Millisecond)
-	close(release)
-
-	for i := 0; i < callers; i++ {
-		if got := <-ids; !strings.Contains(strings.Join(got, "\n"), "kr/auto") {
-			t.Fatalf("caller %d did not receive the live catalog: %v", i, got)
-		}
+	raw, ok := kv["conn-kiro-persist"]
+	if !ok || raw == "" {
+		t.Fatal("refresh must persist the catalog to the liveCatalogs kv scope")
 	}
-	if n := hits.Load(); n != 1 {
-		t.Errorf("expected exactly 1 upstream fetch for %d concurrent callers, got %d", callers, n)
+	var record persistedLiveCatalog
+	if err := json.Unmarshal([]byte(raw), &record); err != nil {
+		t.Fatalf("persisted record invalid: %v", err)
+	}
+	if len(record.Models) == 0 || record.Models[0].ID != "auto" {
+		t.Errorf("persisted models wrong: %+v", record.Models)
+	}
+	if _, perr := time.Parse(time.RFC3339, record.SyncedAt); perr != nil {
+		t.Errorf("syncedAt not RFC3339: %v", perr)
 	}
 }
 

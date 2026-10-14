@@ -15,6 +15,7 @@ import (
 
 	"9router/proxy/internal/config"
 	"9router/proxy/internal/db"
+	"9router/proxy/internal/handlers/chat"
 	"9router/proxy/internal/providers"
 	"9router/proxy/internal/proxy/oauth"
 	"9router/proxy/internal/shutdown"
@@ -96,6 +97,10 @@ func ProvideServer(p ServerParams) *http.Server {
 			providers.StartBackgroundCatalogSync(shutdown.Context(), nil, catalogPath)
 			oauth.StartBackgroundRefresh(shutdown.Context(), p.Repo)
 			db.StartRetentionLoop(shutdown.Context(), p.Repo, db.DefaultRequestDetailRetention)
+			// Daily live-catalog refresh: /v1/models never fetches, so this is
+			// what keeps the persisted catalogs current (dashboard sync button
+			// is the other, on-demand entry point).
+			chat.StartBackgroundLiveCatalogRefresh(shutdown.Context(), p.Repo)
 
 			log.Printf("9router-go Proxy (%s) starting on port %d", updater.CurrentVersion, p.Config.Port)
 
