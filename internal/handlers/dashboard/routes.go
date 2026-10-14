@@ -4,6 +4,7 @@ import (
 	"net/http"
 
 	"9router/proxy/internal/db"
+	"9router/proxy/internal/handlers/chat"
 	"9router/proxy/internal/handlers/shared"
 	"9router/proxy/internal/observ"
 	"9router/proxy/internal/semanticcache"
@@ -23,6 +24,10 @@ type DashboardHandler struct {
 	SecondaryProbeURL string
 	TokenSaver        *shared.TokenSaverConfig
 	SemanticCache     *semanticcache.Cache
+	// ChatHandler is the engine's chat handler, wired by the router when the
+	// dashboard and engine share the process. The live-catalog refresh needs
+	// it because discovery (kiro / grok-cli / compatible nodes) lives there.
+	ChatHandler *chat.ChatHandler
 }
 
 // NewDashboardHandler initializes a DashboardHandler with the provided Repo.

@@ -217,6 +217,35 @@
     allAvailableModels.length > 0 && disabledModelIds.length >= allAvailableModels.length
   )
   let isSyncingModels = $state(false)
+  let isRefreshingLiveCatalog = $state(false)
+  // hasLiveCatalogResolver mirrors the backend resolver set
+  // (chat.hasLiveCatalogResolver): kiro, grok-cli, and compatible nodes.
+  let hasLiveCatalogResolver = $derived(
+    providerId === 'kiro' ||
+      providerId === 'grok-cli' ||
+      providerId.startsWith('openai-compatible-') ||
+      providerId.startsWith('anthropic-compatible-') ||
+      providerId.startsWith('custom-embedding-'),
+  )
+
+  async function handleRefreshLiveCatalog() {
+    if (isRefreshingLiveCatalog) return
+    const pid = providerId
+    isRefreshingLiveCatalog = true
+    try {
+      await api.refreshLiveCatalog(pid)
+      if (pid !== providerId) return
+      // The published list is read from the persisted catalog on the next
+      // request; re-fetch the view's model data so it reflects the refresh.
+      const modelsData = await fetchProviderModelsData(providerId, storageAlias)
+      customModels = modelsData.customModels
+      notifyCustomModelsChanged()
+    } catch (err) {
+      if (pid === providerId) alert(err instanceof Error ? err.message : 'Live catalog refresh failed')
+    } finally {
+      if (pid === providerId) isRefreshingLiveCatalog = false
+    }
+  }
   let modelDeprecationCount = $state(0)
 
   // Capabilities + thinking levels are resolved server-side (GET /api/models/caps):
@@ -3905,6 +3934,21 @@
             {isSyncingModels ? 'progress_activity' : 'sync'}
           </span>
           {isSyncingModels ? 'Syncing...' : 'Sync Models'}
+        </button>
+      {/if}
+
+      {#if hasLiveCatalogResolver && providerConnections.some((c) => c.isActive !== 0)}
+        <button
+          type="button"
+          onclick={handleRefreshLiveCatalog}
+          disabled={isRefreshingLiveCatalog}
+          class="flex w-full items-center justify-center gap-1.5 rounded-lg border border-border bg-surface-2 hover:bg-surface-3 px-3 py-2 text-xs text-text-main transition-colors sm:w-auto cursor-pointer disabled:opacity-50"
+          title="Fetch the provider's live catalog now and persist it for /v1/models, which serves cached catalogs only"
+        >
+          <span class="material-symbols-outlined text-sm {isRefreshingLiveCatalog ? 'animate-spin' : ''}">
+            {isRefreshingLiveCatalog ? 'progress_activity' : 'cloud_download'}
+          </span>
+          {isRefreshingLiveCatalog ? 'Refreshing...' : 'Refresh Live Catalog'}
         </button>
       {/if}
     </div>

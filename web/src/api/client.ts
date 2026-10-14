@@ -1233,6 +1233,16 @@ export const api = {
       { method: 'POST' },
     ),
   /**
+   * Fetches the provider's live catalog now and persists it for /v1/models,
+   * which answers from cache only (never fetches on request). Omitting the
+   * provider refreshes every connection with a live resolver.
+   */
+  refreshLiveCatalog: (provider?: string) =>
+    request<{ success: boolean; refreshed: number; failed: number; skipped: number }>(
+      `/api/models/live-catalog/refresh${provider ? `?provider=${encodeURIComponent(provider)}` : ''}`,
+      { method: 'POST' },
+    ),
+  /**
    * Pings one model the way the page lists it. `kind` picks the endpoint the
    * probe travels on (upstream /api/models/test `kind`): a System One model
    * answers on /v1/systemone, and a chat probe on it returns 500. Omit `kind`

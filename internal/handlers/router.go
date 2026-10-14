@@ -53,7 +53,12 @@ func SetupRoutes(r interface {
 	dashH := dashboard.NewDashboardHandler(repo, ts)
 	if chatH != nil {
 		dashH.SemanticCache = chatH.SemanticCache
+		dashH.ChatHandler = chatH
 	}
+	// Live catalog refresh: the only operator-facing fetch of a provider's
+	// live catalog — /v1/models answers from cache only (see
+	// internal/handlers/chat/live_catalog_refresh.go).
+	r.Post("/api/models/live-catalog/refresh", dashH.HandleRefreshLiveCatalogs)
 	// Chat & Models Domain (no version here: the four version GETs are
 	// public in SetupServerRouter, upstream PUBLIC_API_PATHS parity).
 	r.Get("/changelog", chatH.HandleChangelog)
@@ -166,6 +171,7 @@ func SetupDashboardRoutes(r chi.Router, repo *db.Repo, chatH *chat.ChatHandler) 
 	dashH := dashboard.NewDashboardHandler(repo, ts)
 	if chatH != nil {
 		dashH.SemanticCache = chatH.SemanticCache
+		dashH.ChatHandler = chatH
 	}
 	ssoH := sso.NewHandler(repo)
 
