@@ -2,11 +2,11 @@ package proxy
 
 import (
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/hex"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -72,7 +72,27 @@ func GenerateOpenCodeRequestID() string {
 	return "msg_" + hex.EncodeToString(timeBytes[:]) + unstableRandomBase62(14)
 }
 
-// TranslateOpenCodeSessionID deterministically maps foreign sessions to valid 30-char canonical IDs.
+// opencodeSessionCache remembers one minted canonical session id per
+// downstream session, so a conversation keeps a stable id across turns
+// (decolua/9router#4791). Hashed ids fail the Zen v2 gate because their
+// prefix does not decode to a recent inverted timestamp.
+type opencodeSessionEntry struct {
+	id        string
+	expiresAt time.Time
+}
+
+var (
+	opencodeSessionMu     sync.Mutex
+	opencodeSessionCache  = map[string]opencodeSessionEntry{}
+	opencodeSessionMaxAge = time.Hour
+	opencodeSessionMaxLen = 1000
+)
+
+// TranslateOpenCodeSessionID maps foreign sessions to valid 30-char canonical
+// IDs. Ids that are already canonical pass through untouched; anything else
+// gets a freshly minted canonical id (GenerateOpenCodeSessionID), cached per
+// downstream session id + client tool so the same conversation maps to the
+// same upstream session until the entry expires.
 func TranslateOpenCodeSessionID(sessionID, clientTool string) string {
 	trimmed := strings.TrimSpace(sessionID)
 	if OpenCodeSessionRegex.MatchString(trimmed) {
@@ -82,28 +102,31 @@ func TranslateOpenCodeSessionID(sessionID, clientTool string) string {
 	if tool == "" {
 		tool = "generic"
 	}
-	h := sha256.New()
-	h.Write([]byte("opencode\x00" + tool + "\x00" + trimmed))
-	digest := h.Sum(nil)
-	// Keep the deterministic time component but pin the low 12 counter bits
-	// to the small value accepted by the OpenCode v2 free-tier gate.
-	timeValue := uint64(0)
-	for _, b := range digest[:5] {
-		timeValue = (timeValue << 8) | uint64(b)
+	key := tool + "\x00" + trimmed
+
+	now := time.Now()
+	opencodeSessionMu.Lock()
+	if entry, ok := opencodeSessionCache[key]; ok && now.Before(entry.expiresAt) {
+		id := entry.id
+		opencodeSessionMu.Unlock()
+		return id
 	}
-	timeValue &= (uint64(1) << 36) - 1
-	current := timeValue*0x1000 + 1
-	var prefix [6]byte
-	for i := range 6 {
-		prefix[i] = byte((^current >> (40 - 8*uint64(i))) & 0xff)
+	id := GenerateOpenCodeSessionID()
+	if len(opencodeSessionCache) >= opencodeSessionMaxLen {
+		// Drop expired entries first; if still full, evict an arbitrary one.
+		for k, e := range opencodeSessionCache {
+			if !now.Before(e.expiresAt) {
+				delete(opencodeSessionCache, k)
+			}
+		}
+		for k := range opencodeSessionCache {
+			delete(opencodeSessionCache, k)
+			break
+		}
 	}
-	timeHex := hex.EncodeToString(prefix[:])
-	var sb strings.Builder
-	sb.Grow(14)
-	for i := 6; i < 20; i++ {
-		sb.WriteByte(base62Chars[int(digest[i])%62])
-	}
-	return "ses_" + timeHex + sb.String()
+	opencodeSessionCache[key] = opencodeSessionEntry{id: id, expiresAt: now.Add(opencodeSessionMaxAge)}
+	opencodeSessionMu.Unlock()
+	return id
 }
 
 var opencodeUARegex = regexp.MustCompile(`(?i)^opencode/([a-z0-9-]+)/(\d+)\.(\d+)\.(\d+)/([a-z0-9-]+)$`)

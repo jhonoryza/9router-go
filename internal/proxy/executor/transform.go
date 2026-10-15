@@ -773,6 +773,24 @@ func stripKimchiReasoningContent(body map[string]any) {
 	}
 }
 
+// isOpencodeFreeTierModelID strips any lane prefix/qualifier from a request
+// model id and reports whether the bare id is an OpenCode free-tier model.
+func isOpencodeFreeTierModelID(model string) bool {
+	base := model
+	if idx := strings.IndexByte(base, '('); idx != -1 {
+		base = base[:idx]
+	}
+	base = strings.TrimPrefix(base, "oc/")
+	base = strings.TrimPrefix(base, "opencode/")
+	base = strings.TrimSpace(base)
+	for _, provider := range []string{"opencode", "opencode-zen", "opencode-go"} {
+		if providers.IsOpencodeFreeTierModel(provider, base) {
+			return true
+		}
+	}
+	return false
+}
+
 // InjectReasoningContent ensures assistant messages in request body have reasoning_content
 // injected (e.g. " " placeholder) for providers like opencode, deepseek, or kimi models.
 func InjectReasoningContent(body []byte, provider string) []byte {
@@ -790,6 +808,12 @@ func InjectReasoningContent(body []byte, provider string) []byte {
 	modelLower := strings.ToLower(modelStr)
 
 	isDeepSeek := strings.Contains(modelLower, "deepseek") || provider == "opencode" || provider == "opencode-go"
+	// decolua/9router#4805: only the free-tier ids on the keyed zen lane
+	// require reasoning on every assistant turn; paid zen models must not be
+	// touched.
+	if !isDeepSeek && provider == "opencode-zen" && isOpencodeFreeTierModelID(modelStr) {
+		isDeepSeek = true
+	}
 	isKimi := strings.HasPrefix(modelLower, "kimi-")
 
 	if !isDeepSeek && !isKimi {
