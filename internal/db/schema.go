@@ -149,6 +149,14 @@ func coreSchema() []tableDef {
 				"CREATE INDEX IF NOT EXISTS idx_uh_conn ON usageHistory(connectionId)",
 				"CREATE INDEX IF NOT EXISTS idx_uh_ts_prov ON usageHistory(timestamp DESC, provider)",
 				"CREATE INDEX IF NOT EXISTS idx_uh_ts_model ON usageHistory(timestamp DESC, model)",
+				// The per-key lifetime token quota sums prompt+completion tokens
+				// WHERE apiKey = ? on every request for a quota-bearing key, and
+				// this ledger is never pruned (see usage_retention.go: it is the
+				// billing record). Without this index that sum is a full scan —
+				// measured at ~150 ms on a 200k-row ledger versus sub-millisecond
+				// with it. EnsureCoreSchema re-runs this list on every boot, so
+				// existing installs pick the index up on the next start.
+				"CREATE INDEX IF NOT EXISTS idx_uh_apikey ON usageHistory(apiKey)",
 			},
 		},
 		{
@@ -271,6 +279,10 @@ var goOnlyColumns = [][3]string{
 	{"apiKeys", "rateLimitRPM", "INTEGER DEFAULT 0"},
 	{"apiKeys", "rateLimitTPM", "INTEGER DEFAULT 0"},
 	{"apiKeys", "rateLimitConcurrency", "INTEGER DEFAULT 0"},
+	// F-1b Budget & queue: cumulative token quota and how long a request may
+	// wait for a concurrency slot before it is refused.
+	{"apiKeys", "tokenQuota", "INTEGER DEFAULT 0"},
+	{"apiKeys", "queueTimeoutMs", "INTEGER DEFAULT 0"},
 	// F-6 Argon2id key hashing
 	{"apiKeys", "keyHash", "TEXT DEFAULT ''"},
 	{"apiKeys", "lookupHash", "TEXT DEFAULT ''"},
