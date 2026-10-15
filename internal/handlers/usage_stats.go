@@ -378,6 +378,42 @@ func HandleUsageStats(repo *db.Repo) http.HandlerFunc {
 						)
 					}
 				}
+
+				// byEndpoint
+				if be, ok := dayData["byEndpoint"].(map[string]any); ok {
+					for epKey, eVal := range be {
+						if em, ok := eVal.(map[string]any); ok {
+							endpoint, _ := em["endpoint"].(string)
+							rawModel, _ := em["rawModel"].(string)
+							prov, _ := em["provider"].(string)
+							if endpoint == "" {
+								parts := strings.Split(epKey, "|")
+								endpoint = parts[0]
+								if len(parts) > 1 && rawModel == "" {
+									rawModel = parts[1]
+								}
+								if len(parts) > 2 && prov == "" {
+									prov = parts[2]
+								}
+							}
+							displayName := prov
+							if dn, ok := nodeNameMap[prov]; ok && dn != "" {
+								displayName = dn
+							}
+
+							cur := resp.ByEndpoint[epKey]
+							cur.Endpoint = endpoint
+							cur.RawModel = rawModel
+							cur.Provider = displayName
+							cur.Requests += getMapInt(em, "requests")
+							cur.PromptTokens += getMapInt64(em, "promptTokens")
+							cur.CompletionTokens += getMapInt64(em, "completionTokens")
+							cur.CachedTokens += getMapInt64(em, "cachedTokens")
+							cur.Cost += getMapFloat(em, "cost")
+							resp.ByEndpoint[epKey] = cur
+						}
+					}
+				}
 			}
 		} else {
 			// Sub-day windows read raw history: a daily rollup cannot express

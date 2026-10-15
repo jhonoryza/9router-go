@@ -117,7 +117,17 @@
                         class="w-4 h-4 object-contain rounded shrink-0 bg-surface-2 p-0.5 border border-border/40 text-[9px] leading-none font-semibold"
                       />
                     {/if}
-                    <span class="truncate">{row.rawModel || row.accountName || row.keyName || row.endpoint || row.key}</span>
+                    <span class="truncate">
+                      {#if tableView === 'account'}
+                        {row.accountName || row.key}
+                      {:else if tableView === 'apiKey'}
+                        {row.keyName || row.key}
+                      {:else if tableView === 'endpoint'}
+                        {row.endpoint || row.key}
+                      {:else}
+                        {row.rawModel || row.key}
+                      {/if}
+                    </span>
                   </div>
                 </td>
                 <td class="py-3 px-4">
