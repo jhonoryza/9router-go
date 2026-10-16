@@ -741,15 +741,14 @@ func isOpenCodeAutoToolChoiceModel(cleanModel string) bool {
 // free tier. Keyed zen requests for these ids answer 403 ("free tier can only
 // be used from within OpenCode"), so the zen lane forwards them to the
 // keyless /inference/v1 gate with public credentials. The source of truth is
-// the curated registry (providers.IsOpencodeFreeTierModel) — never suffix
-// matching.
+// the curated registry and -free suffix matching (providers.IsOpencodeFreeTierModel).
 func isOpencodeFreeModel(cleanModel string) bool {
 	base := cleanModel
 	if parenIdx := strings.IndexByte(base, '('); parenIdx != -1 {
 		base = base[:parenIdx]
 	}
-	// IsOpencodeFreeTierModel already requires catalog membership, so this
-	// stays catalog-driven across all three lanes (free, zen, go).
+	// IsOpencodeFreeTierModel handles catalog membership and -free suffix rules,
+	// keeping resolution consistent across all three lanes (free, zen, go).
 	for _, provider := range []string{"opencode", "opencode-zen", "opencode-go"} {
 		if providers.IsOpencodeFreeTierModel(provider, base) {
 			return true

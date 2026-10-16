@@ -414,6 +414,33 @@ func TestIsOpencodeGoResponsesModel(t *testing.T) {
 	}
 }
 
+func TestIsOpencodeFreeModel(t *testing.T) {
+	tests := []struct {
+		model string
+		want  bool
+	}{
+		{"big-pickle", false},
+		{"big-pickle(high)", false},
+		{"longcat-2.5-preview-free", true},
+		{"longcat-2.5-preview-free(thinking)", true},
+		{"deepseek-v4-flash-free", true},
+		{"muse-spark-1.3-contributor-free", true},
+		{"space-bunny-free", true},
+		{"jev-1.13-free", true},
+		{"deepseek-v4-pro", false},
+		{"grok-4.6", false},
+		{"gpt-5.6-luna", false},
+		{"", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.model, func(t *testing.T) {
+			if got := isOpencodeFreeModel(tt.model); got != tt.want {
+				t.Errorf("isOpencodeFreeModel(%q) = %v, want %v", tt.model, got, tt.want)
+			}
+		})
+	}
+}
+
 // A paid go Muse Spark model must stay on the go Responses lane with the v1
 // identity — the free-executor narrowing must never leak into this lane.
 func TestForwardOpencodeGo_MuseSparkResponsesRouting(t *testing.T) {

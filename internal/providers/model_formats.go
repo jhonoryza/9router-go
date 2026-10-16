@@ -270,10 +270,21 @@ var openCodeFreeTierModels = map[string]bool{
 
 // IsOpencodeFreeTierModel reports whether a bare model id is one of the
 // OpenCode free-tier ids, so executors can pick the /inference/v1 prefix.
-// The model must also be curated for the named provider; an id that only
-// exists on the free provider is not a zen free model and vice versa.
+// The model must either be in openCodeFreeTierModels or carry the "-free" suffix
+// on one of the OpenCode providers (opencode, opencode-zen, opencode-go),
+// allowing newly released or uncataloged free models (e.g. longcat-2.5-preview-free)
+// to automatically route to the keyless /inference/v1 gate.
 func IsOpencodeFreeTierModel(provider, baseModelID string) bool {
-	if !openCodeFreeTierModels[baseModelID] {
+	isFree := openCodeFreeTierModels[baseModelID] || strings.HasSuffix(baseModelID, "-free")
+	if !isFree {
+		return false
+	}
+	switch provider {
+	case "opencode", "opencode-zen", "opencode-go", "oc", "ocz", "ocg":
+		if strings.HasSuffix(baseModelID, "-free") {
+			return true
+		}
+	default:
 		return false
 	}
 	models := ProviderModels[provider]
