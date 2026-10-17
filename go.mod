@@ -3,6 +3,7 @@ module 9router/proxy
 go 1.27
 
 require (
+	github.com/aws/aws-sdk-go-v2/config v1.33.9
 	github.com/go-chi/chi/v5 v5.3.1
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.5.3
@@ -11,7 +12,7 @@ require (
 	github.com/samber/lo v1.53.0
 	github.com/spf13/viper v1.21.0
 	github.com/urfave/cli/v2 v2.27.7
-	github.com/yuin/goldmark v1.7.8
+	github.com/yuin/goldmark v1.7.17
 	go.uber.org/fx v1.24.0
 	golang.org/x/crypto v0.57.0
 	golang.org/x/sync v0.23.0
@@ -22,7 +23,6 @@ require (
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.47.3 // indirect
-	github.com/aws/aws-sdk-go-v2/config v1.33.9 // indirect
 	github.com/aws/aws-sdk-go-v2/credentials v1.20.9 // indirect
 	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.20.3 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/configsources v1.5.6 // indirect
