@@ -304,8 +304,13 @@ func SetupDashboardRoutes(r chi.Router, repo *db.Repo, chatH *chat.ChatHandler) 
 	r.Post("/api/settings/database", dashH.HandleImportDatabase)
 	r.Get("/api/settings/database/stats", dashH.HandleGetDatabaseStats)
 	r.Post("/api/settings/database/prune", dashH.HandlePruneDatabase)
+	r.Post("/api/settings/database/prune-usage", dashH.HandlePruneUsageHistory)
 	r.Post("/api/settings/database/vacuum", dashH.HandleVacuumDatabase)
 	r.Post("/api/settings/proxy-test", dashH.HandleProxyTest)
+
+	// Currency rates (profile page): reads live USD rates for the catalog codes
+	// and stores the subset the display uses.
+	r.Post("/api/settings/currency/refresh", dashH.HandleRefreshCurrencyRates)
 
 	// Token saver testing benches & filter catalog
 	r.Get("/api/tokensaver/rtk/filters", dashH.HandleGetRTKFilters)

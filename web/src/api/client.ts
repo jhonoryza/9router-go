@@ -3,6 +3,17 @@ export interface DatabaseStats {
   reclaimableBytes: number
   requestDetailsCount: number
   usageHistoryCount: number
+  usageHistoryOldestTimestamp?: string
+  usageHistoryNewestTimestamp?: string
+}
+
+export interface PruneUsageResult {
+  success: boolean
+  dryRun: boolean
+  wouldDelete?: number
+  pruned?: number
+  carriedTokens?: number
+  cutoff: string
 }
 // Typed API client for 9router-go Native Dashboard
 
@@ -244,6 +255,22 @@ export interface Settings {
   outboundProxyUrl?: string
   outboundNoProxy?: string
   providerStrategies?: Record<string, ProviderStrategyConfig>
+  /**
+   * Feature Visibility: sidebar entry ids the operator hid. The canonical id
+   * list lives in web/src/lib/nav.ts; the server only checks the shape
+   * (internal/handlers/dashboard/navvisibility.go).
+   */
+  navVisibility?: { hidden?: string[] }
+  /**
+   * Display currency for every cost surface. Costs themselves are stored in USD;
+   * see web/src/lib/currency.ts for the catalog and the formatting rules.
+   */
+  displayCurrency?: {
+    code?: string
+    rates?: Record<string, number>
+    showBoth?: boolean
+    updatedAt?: string
+  }
   [key: string]: unknown
 }
 
@@ -1382,11 +1409,34 @@ export const api = {
       method: 'PATCH',
       body: JSON.stringify(settings),
     }),
+  /**
+   * Reads live USD rates for the requested codes and stores the subset.
+   * `codes` is the catalog the dashboard offers (web/src/lib/currency.ts).
+   */
+  refreshCurrencyRates: (payload: { code: string; showBoth: boolean; codes: string[] }) =>
+    request<{ displayCurrency: unknown; source: string; ratesStored: number }>(
+      '/api/settings/currency/refresh',
+      {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      }
+    ),
   getDatabaseStats: () => request<DatabaseStats>('/api/settings/database/stats'),
   pruneDatabase: () =>
     request<{ success: boolean; pruned: number }>('/api/settings/database/prune', {
       method: 'POST',
     }),
+  pruneUsageHistory: (params?: { days?: number; before?: string; dryRun?: boolean }) => {
+    const query = new URLSearchParams()
+    if (params?.dryRun) query.set('dryRun', '1')
+    if (typeof params?.days === 'number') query.set('days', String(params.days))
+    if (params?.before) query.set('before', params.before)
+    const qs = query.toString()
+    return request<PruneUsageResult>(`/api/settings/database/prune-usage${qs ? `?${qs}` : ''}`, {
+      method: 'POST',
+      body: params?.days || params?.before ? JSON.stringify({ days: params.days, before: params.before }) : undefined,
+    })
+  },
   vacuumDatabase: () =>
     request<{ success: boolean; databaseSizeBytes: number; reclaimableBytes: number }>(
       '/api/settings/database/vacuum',

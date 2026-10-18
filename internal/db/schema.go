@@ -142,6 +142,7 @@ func coreSchema() []tableDef {
 				{"status", "TEXT"},
 				{"tokens", "TEXT"},
 				{"meta", "TEXT"},
+				{"clientKey", "TEXT DEFAULT ''"},
 			},
 			indexes: []string{
 				"CREATE INDEX IF NOT EXISTS idx_uh_ts ON usageHistory(timestamp DESC)",
@@ -151,13 +152,17 @@ func coreSchema() []tableDef {
 				"CREATE INDEX IF NOT EXISTS idx_uh_ts_prov ON usageHistory(timestamp DESC, provider)",
 				"CREATE INDEX IF NOT EXISTS idx_uh_ts_model ON usageHistory(timestamp DESC, model)",
 				// The per-key lifetime token quota sums prompt+completion tokens
-				// WHERE apiKey = ? on every request for a quota-bearing key, and
-				// this ledger is never pruned (see usage_retention.go: it is the
-				// billing record). Without this index that sum is a full scan —
-				// measured at ~150 ms on a 200k-row ledger versus sub-millisecond
-				// with it. EnsureCoreSchema re-runs this list on every boot, so
-				// existing installs pick the index up on the next start.
+				// over `clientKey = ? OR apiKey = ? OR apiKey = ?` (tokenUsageSince,
+				// quota_reset.go). SQLite answers a disjunction with a multi-index
+				// OR only when EVERY arm is indexable, so idx_uh_apikey alone was
+				// not enough: the unindexed clientKey arm degraded the whole
+				// statement to `SCAN usageHistory`. That scan ran once per key row
+				// in GET /api/keys (apiKeyUsedTokens), which is on the dashboard's
+				// boot path — measured on a 512k-row ledger at ~127 ms per key, so
+				// a 50-key install spent ~10 s in that one request. Both columns
+				// need their own index for the OR to use indexes at all.
 				"CREATE INDEX IF NOT EXISTS idx_uh_apikey ON usageHistory(apiKey)",
+				"CREATE INDEX IF NOT EXISTS idx_uh_clientkey ON usageHistory(clientKey)",
 			},
 		},
 		{
@@ -388,6 +393,44 @@ var keiRouterTables = []tableDef{
 	},
 }
 
+// usageLedgerTables are Go-only tables backing the ledger retention in
+// usage_retention_ledger.go. They are declared apart from keiRouterTables
+// because they are not a ported feature: they exist so an opt-in prune of the
+// billing ledger cannot refund a per-key token budget.
+//
+// usageLedgerCarryover is one row per client key and is read by exactly one
+// statement (tokenUsageSince). It is deliberately NOT a synthetic row inside
+// usageHistory: a marker row there would be indistinguishable from real traffic
+// for every other ledger consumer — the sub-day usage window, the daily chart's
+// per-family split, the analytics scans, the topology map — each of which would
+// then need its own filter, and any one of them forgetting it reports spend that
+// never happened.
+var usageLedgerTables = []tableDef{
+	{
+		name: "usageLedgerCarryover",
+		columns: [][2]string{
+			{"keyId", "TEXT PRIMARY KEY"},
+			{"tokens", "INTEGER NOT NULL DEFAULT 0"},
+			{"updatedAt", "TEXT NOT NULL"},
+		},
+	},
+}
+
+// EnsureLedgerTables creates the Go-only tables the ledger retention needs.
+// Exported for the same reason as EnsureKeiRouterTables: a test fixture that
+// builds only the upstream core schema still gets the shape the runtime queries.
+func EnsureLedgerTables(db *sql.DB) error {
+	if db == nil {
+		return fmt.Errorf("usage ledger tables: nil db")
+	}
+	for _, t := range usageLedgerTables {
+		if err := ensureTable(db, t); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // supersededIndexes are dropped on every boot: each was replaced by an index
 // whose shape a measured query plan chose, and keeping the old ones would leave
 // SQLite with candidates it never picks while every write still updates them.
@@ -432,6 +475,9 @@ func EnsureCoreSchema(db *sql.DB) error {
 		}
 	}
 	if err := EnsureKeiRouterTables(db); err != nil {
+		return err
+	}
+	if err := EnsureLedgerTables(db); err != nil {
 		return err
 	}
 	if err := EnsureAdditiveColumns(db); err != nil {

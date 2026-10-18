@@ -3,6 +3,7 @@ package proxy
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
 	"regexp"
 	"strconv"
 	"strings"
@@ -164,6 +165,23 @@ func HasValidOpenCodeV1Version(ua string) bool {
 
 var opencodeV1UARegex = regexp.MustCompile(`(?i)opencode/(\d+)\.(\d+)(?:\.(\d+))?`)
 
+func generateTraceHeaders() (string, string) {
+	var traceID [16]byte
+	var spanID [8]byte
+	var parentSpanID [8]byte
+	_, _ = rand.Read(traceID[:])
+	_, _ = rand.Read(spanID[:])
+	_, _ = rand.Read(parentSpanID[:])
+
+	tHex := hex.EncodeToString(traceID[:])
+	sHex := hex.EncodeToString(spanID[:])
+	pHex := hex.EncodeToString(parentSpanID[:])
+
+	b3 := fmt.Sprintf("%s-%s-1-%s", tHex, sHex, pHex)
+	traceparent := fmt.Sprintf("00-%s-%s-01", tHex, sHex)
+	return b3, traceparent
+}
+
 // BuildOpenCodeHeaders generates the official OpenCode fingerprint headers to prevent 403 FreeTierError.
 func BuildOpenCodeHeaders(rawHeaders map[string]string, sessionID string, isStream bool) map[string]string {
 	var session string
@@ -172,6 +190,8 @@ func BuildOpenCodeHeaders(rawHeaders map[string]string, sessionID string, isStre
 	} else {
 		session = GenerateOpenCodeSessionID()
 	}
+
+	b3, traceparent := generateTraceHeaders()
 
 	res := map[string]string{
 		"Content-Type":          "application/json",
@@ -182,6 +202,8 @@ func BuildOpenCodeHeaders(rawHeaders map[string]string, sessionID string, isStre
 		"x-opencode-session-id": session,
 		"x-session-affinity":    session,
 		"x-session-id":          session,
+		"b3":                    b3,
+		"traceparent":           traceparent,
 		// Upstream defaults the project to "global"
 		// (open-sse/executors/opencode.js buildHeaders).
 		"x-opencode-project": "global",
@@ -223,6 +245,18 @@ func BuildOpenCodeHeaders(rawHeaders map[string]string, sessionID string, isStre
 		if lk == "x-opencode-project" {
 			if trimmed := strings.TrimSpace(v); trimmed != "" {
 				res["x-opencode-project"] = trimmed
+			}
+		}
+		if lk == "b3" {
+			trimmed := strings.TrimSpace(v)
+			if trimmed != "" {
+				res["b3"] = trimmed
+			}
+		}
+		if lk == "traceparent" {
+			trimmed := strings.TrimSpace(v)
+			if trimmed != "" {
+				res["traceparent"] = trimmed
 			}
 		}
 	}
