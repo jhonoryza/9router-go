@@ -104,11 +104,15 @@ func (h *ChatHandler) fetchAndStoreLiveCatalog(ctx context.Context, conn *models
 		return nil
 	}
 
-	discovered := fetch(ctx, accessToken)
+	// The refresh serves every caller of this connection, so the fetch
+	// must not inherit one dashboard request's cancellation (#364):
+	// detaching leaves each fetch's own HTTP timeout as the only bound.
+	flightCtx := context.WithoutCancel(ctx)
+	discovered := fetch(flightCtx, accessToken)
 	if len(discovered) == 0 && liveCatalogRefreshToken(conn) != "" {
 		// Upstream refreshes the credential on 401/403 and retries once.
 		if refreshed, _, rErr := h.forceRefreshOAuthToken(conn.ID); rErr == nil && refreshed != "" {
-			discovered = fetch(ctx, refreshed)
+			discovered = fetch(flightCtx, refreshed)
 		} else {
 			log.Warn("live-catalog", "token refresh failed", "provider", providerID, "conn", conn.ID, "error", rErr)
 		}

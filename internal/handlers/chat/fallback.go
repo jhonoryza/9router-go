@@ -29,6 +29,10 @@ import (
 // StatusClientClosedRequest is the canonical HTTP status for client connection aborts (nginx 499).
 const StatusClientClosedRequest = 499
 
+// clientClosedBody is the JSON body that travels with StatusClientClosedRequest.
+// Single-sourced so the combo and account-fallback paths cannot drift apart.
+const clientClosedBody = `{"error":{"message":"client closed request","type":"client_closed_request","code":499}}`
+
 // borrowZenKeyForGo returns the identity and key of an active opencode-zen
 // connection for the paid go lane, which shares the same backend account.
 // Only used when no go connection exists at all; resolution goes through the
@@ -509,10 +513,19 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
 	metrics := &streamMetrics{}
 	var fwdErr error
 
-	usagetracker.GetTracker().TrackPending(model, provider, connectionID, true, false)
+	// The names behind this in-flight request. The forwarder carries both: for
+	// a combo request RequestedModel is the combo the client asked for and
+	// ComboName marks that a combo served it, while model/provider name the
+	// member that is doing the work. The dashboard animates exactly that hop.
+	requestedName := f.RequestedModel
+	if requestedName == "" {
+		requestedName = translator.RequestedModelFromContext(ctx)
+	}
+	comboName := f.ComboName
+	usagetracker.GetTracker().TrackPendingRequested(requestedName, comboName, model, provider, connectionID, true, false)
 	defer func() {
 		hasErr := fwdErr != nil
-		usagetracker.GetTracker().TrackPending(model, provider, connectionID, false, hasErr)
+		usagetracker.GetTracker().TrackPendingRequested(requestedName, comboName, model, provider, connectionID, false, hasErr)
 	}()
 
 	// A connection bound to a pool that cannot serve traffic must fail before
@@ -604,7 +617,7 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
 	if reserved, ok := middleware.ReservedTokensFromContext(ctx); ok && h.RateLimiter != nil {
 		if clientKey := requestKeyFromContext(ctx); clientKey != nil {
 			ctx = middleware.WithTokenSettler(ctx, func(actual int) {
-				if limit := middleware.EffectiveTPM(h.rateLimitDefaults(), clientKey); limit > 0 {
+				if limit := h.RateLimiter.EffectiveTPM(h.rateLimitDefaults(), clientKey); limit > 0 {
 					h.RateLimiter.SettleTokenUsage(clientKey.ID, limit, reserved, actual)
 				}
 			})
@@ -882,6 +895,14 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
 	}
 
 	observ.IncUpstreamError(provider, model, statusCode)
+	// A client that hung up is not an upstream failure. Returning the raw error
+	// here made every abort surface as a bare 502 at the write sites in chat.go:
+	// the caller saw "upstream error: context canceled" and the request log
+	// recorded a 5xx for a disconnect the gateway did not cause. The combo path
+	// already reports this as 499, so the two agree.
+	if isClientCanceled(ctx, fwdErr) {
+		return &upstreamError{StatusCode: StatusClientClosedRequest, Body: []byte(clientClosedBody)}
+	}
 	return fwdErr
 }
 func isClientCanceled(ctx context.Context, err error) bool {
@@ -967,6 +988,21 @@ func (h *ChatHandler) applyTokenSavers(body []byte, claudeNative bool) ([]byte, 
 		prompt := tokensaver.GetADHDPrompt(h.TokenSaver.ADHDLevel())
 		if next, did := inject(out, prompt); did {
 			out = next
+		}
+	}
+	// Global system prompt, last in the chain so the prefix stays the first
+	// thing the model reads and the suffix its last word — after every style
+	// prompt has been appended in between.
+	if h.TokenSaver.SystemPromptEnabled() {
+		if prefix := h.TokenSaver.SystemPromptPrefix(); prefix != "" {
+			if next, did := tokensaver.InjectPrefixSystemPrompt(out, prefix, claudeNative); did {
+				out = next
+			}
+		}
+		if suffix := h.TokenSaver.SystemPromptSuffix(); suffix != "" {
+			if next, did := tokensaver.InjectSuffixSystemPrompt(out, suffix, claudeNative); did {
+				out = next
+			}
 		}
 	}
 	return out, origTokens, savedTokens, savedPct

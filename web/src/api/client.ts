@@ -89,6 +89,8 @@ export interface APIKey {
   rateLimitConcurrency?: number
   /** Lifetime prompt+completion token budget. 0 means unlimited. */
   tokenQuota?: number
+  /** Spend recorded against tokenQuota since the budget was last reset (#365). */
+  usedTokens?: number
   /** How long a request waits for a free concurrency slot, in ms. 0 uses the server default. */
   queueTimeoutMs?: number
   /** RFC3339 UTC. Empty means the key never expires. */
@@ -97,6 +99,8 @@ export interface APIKey {
   usedCount?: number
   /** Free-form JSON object, e.g. { customerId, priceCents }. */
   metadata?: string
+  /** Plan template this key inherits from. Empty means no plan. */
+  planId?: string
 }
 
 export interface APIKeyPolicy {
@@ -111,7 +115,32 @@ export interface APIKeyPolicy {
   metadata?: string
   /** Renames the key. An empty string clears the stored name. */
   name?: string
+  /** Plan template to inherit. An empty string detaches the key. */
+  planId?: string
 }
+
+/** A reusable policy template (F-3). Keys inherit its limits as defaults. */
+export interface Plan {
+  id: string
+  name: string
+  description: string
+  limitMicros: number
+  limitTokens: number
+  rpmLimit: number
+  tpmLimit: number
+  concurrencyLimit: number
+  period: PlanPeriod
+  alertPct: number
+  hardCutoff: boolean
+  allowedModels: string[]
+  createdAt: string
+  updatedAt: string
+}
+
+export type PlanPeriod = 'daily' | 'weekly' | 'monthly' | 'total'
+
+/** A plan write. Omitted fields keep their stored value on update. */
+export type PlanInput = Partial<Omit<Plan, 'id' | 'createdAt' | 'updatedAt'>>
 
 export interface GuardrailPolicy {
   id: string
@@ -207,6 +236,10 @@ export interface Settings {
   /** Serve requests from the account that frees up first when all are cooling down. */
   forceFallback?: boolean
   enableObservability?: boolean
+  /** Global system prompt: prefix leads the system prompt, suffix ends it. */
+  systemPromptEnabled?: boolean
+  systemPromptPrefix?: string
+  systemPromptSuffix?: string
   outboundProxyEnabled?: boolean
   outboundProxyUrl?: string
   outboundNoProxy?: string
@@ -474,6 +507,54 @@ export interface ConnectionUsageResponse {
   plan?: string
   quotas?: Record<string, ConnectionQuotaInfo> | ConnectionQuotaInfo[]
   error?: string
+}
+
+// Usage dashboard (Details section): heatmap cells, lifetime cards, node health.
+export interface UsageDailyPoint {
+  date: string
+  requests: number
+  tokens: number
+  cost: number
+}
+export interface UsageTopModel {
+  model: string
+  provider?: string
+  tokens: number
+}
+export interface UsageLifetime {
+  totalRequests: number
+  totalTokens: number
+  peakTokens: number
+  peakDate: string
+  currentStreak: number
+  longestStreak: number
+  topModel: UsageTopModel | null
+  cacheHitRate: number | null
+  cacheTokens: number
+  cacheRequests: number
+}
+export interface UsageNodeHealth {
+  name?: string
+  model?: string
+  provider: string
+  requests: number
+  errors: number
+  successRate: number
+  avgLatencyMs: number | null
+  avgTtftMs: number | null
+  avgSpeed: number | null
+  hasPerfData: boolean
+  score: number | null
+  promptTokens: number
+  completionTokens: number
+  cost: number
+  lastUsed: string
+}
+export interface UsageDashboardResponse {
+  daily: UsageDailyPoint[]
+  nodes: UsageNodeHealth[]
+  models: UsageNodeHealth[]
+  lifetime: UsageLifetime | null
 }
 
 // Codex reset credits. `selectionToken` is the field the dashboard selects
@@ -1112,6 +1193,16 @@ export const api = {
     request<{ status: string; id: string; key: string }>(`/api/keys/${encodeURIComponent(id)}/rotate`, {
       method: 'POST',
     }),
+  /**
+   * Clears a key's spent token budget (#365). The server stamps the usage mark
+   * the budget is measured from, so the key starts over while its history stays
+   * intact, and the response carries the spend it now has (0).
+   */
+  resetApiKeyQuota: (id: string) =>
+    request<{ status: string; id: string; usedTokens: number; tokenQuota: number; quotaResetId: number }>(
+      `/api/keys/${encodeURIComponent(id)}/reset-quota`,
+      { method: 'POST' },
+    ),
   setApiKeyActive: (id: string, isActive: boolean) =>
     request<{ status: string; id: string; isActive: boolean }>(
       `/api/keys/${encodeURIComponent(id)}/toggle`,
@@ -1132,6 +1223,23 @@ export const api = {
       method: 'PUT',
       body: JSON.stringify({ models }),
     }),
+
+  // F-3 plan templates: the reusable policy a key inherits from.
+  getPlans: () => request<{ plans: Plan[] }>('/api/plans'),
+  getPlan: (id: string) => request<Plan>(`/api/plans/${encodeURIComponent(id)}`),
+  createPlan: (plan: PlanInput) =>
+    request<Plan>('/api/plans', { method: 'POST', body: JSON.stringify(plan) }),
+  updatePlan: (id: string, plan: PlanInput) =>
+    request<Plan>(`/api/plans/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      body: JSON.stringify(plan),
+    }),
+  deletePlan: (id: string) =>
+    request<{ status: string; id: string }>(`/api/plans/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    }),
+  getPlanKeys: (id: string) =>
+    request<{ id: string; keys: number }>(`/api/plans/${encodeURIComponent(id)}/keys`),
 
   // F-5 credential vault
   getVaultStatus: () => request<VaultStatus>('/api/vault/status'),
@@ -1525,6 +1633,13 @@ export const api = {
 
   // Usage & Telemetry
   getUsageStats: (period = 'today') => request<any>(`/api/usage/stats?period=${encodeURIComponent(period)}`),
+  /** One chart point: bucket label (HH:MM or MMM D), totals, and the per-model-family token split. */
+  getUsageChart: (period = '7d') =>
+    request<{ label: string; tokens: number; cost: number; byModel: Record<string, number> }[]>(
+      `/api/usage/chart?period=${encodeURIComponent(period)}`
+    ),
+  /** Details-section dashboard payload: heatmap days, lifetime cards, node health. */
+  getUsageDashboard: () => request<UsageDashboardResponse>('/api/usage/dashboard'),
   getRequestDetails: (limit = 50, offset = 0) =>
     request<any>(`/api/usage/request-details?limit=${limit}&offset=${offset}`),
   /** Full stored payload for one request; the list omits request/response bodies. */
