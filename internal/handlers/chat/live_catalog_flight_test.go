@@ -16,17 +16,16 @@ import (
 // TestLiveCatalogFlightSurvivesLeaderCancellation pins that the shared catalog
 // fetch is not cancelled when the caller who started it disconnects.
 //
-// resolveLiveCatalog collapses N racing requests into one upstream call via
-// singleflight, but the closure captured the leader's request context. When the
-// leader's client hung up, context cancellation tore down the fetch for every
-// waiter as well — and because an empty result caches nothing, the next
-// dashboard poll repeated the whole call. The log showed the consequence: far
-// more "context canceled" than "context deadline exceeded".
-//
-// The upstream here answers the first request only after the test releases it,
-// and fails every later one, so the shared call must complete for the follower
-// to see anything. That also pins that exactly one upstream call was made.
+// DIVERGENCE (this fork): resolveLiveCatalog here is cache-only — it never
+// fetches in the request path (PR #1). The fetch happens only in the dashboard
+// refresh path (live_catalog_refresh.go, POST /api/models/live-catalog/refresh
+// and the daily job), which carries the same WithoutCancel guard from upstream
+// #364. This test pins upstream's inline-fetch design, so it would deadlock
+// waiting for a fetch that this build intentionally never performs. Skipped
+// rather than deleted so the divergence stays visible next to the upstream
+// commit.
 func TestLiveCatalogFlightSurvivesLeaderCancellation(t *testing.T) {
+	t.Skip("this fork is cache-only: resolveLiveCatalog never fetches (PR #1); the #364 WithoutCancel guard lives in the refresh path")
 	var calls atomic.Int32
 	entered := make(chan struct{})
 	release := make(chan struct{})
