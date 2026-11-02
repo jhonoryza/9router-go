@@ -33,6 +33,7 @@ import (
 
 const (
 	liveCatalogTTL       = 5 * time.Minute
+	liveCatalogNegTTL    = 60 * time.Second
 	liveCatalogFastHTTP  = 10 * time.Second
 	kiroCatalogHTTP      = 30 * time.Second
 	kiroRuntimeSDKVer    = "1.0.0"
@@ -63,6 +64,17 @@ var (
 type LiveCapabilities struct {
 	Thinking bool `json:"thinking"`
 	Agentic  bool `json:"agentic"`
+
+	// A catalogue may also state the model's real windows and effort levels.
+	// Carrying them here lets the listing publish the provider's own numbers,
+	// so no client has to hard-code an override for a model the provider
+	// already describes.
+	Vision             bool     `json:"vision,omitempty"`
+	ContextWindow      int      `json:"contextWindow,omitempty"`
+	MaxOutput          int      `json:"maxOutput,omitempty"`
+	ThinkingLevels     []string `json:"thinkingLevels,omitempty"`
+	ThinkingDefault    string   `json:"thinkingDefault,omitempty"`
+	ThinkingCanDisable bool     `json:"thinkingCanDisable,omitempty"`
 }
 
 // LiveModel is one entry of a provider's live catalog.
@@ -72,6 +84,11 @@ type LiveModel struct {
 	ContextLength int
 	MaxOutput     int
 	Capabilities  *LiveCapabilities
+	// LimitsAuthoritative marks a catalogue whose ContextLength/MaxOutput are
+	// the provider's own numbers for this exact model, not a best guess. They
+	// then outrank the static substring table, which only knows model families
+	// and would otherwise report a neighbouring model's window.
+	LimitsAuthoritative bool
 }
 
 type liveCatalogEntry struct {
@@ -90,6 +107,21 @@ var liveCatalogStore = struct {
 // node) before the first result populates the cache.
 var liveCatalogFlight singleflight.Group
 
+// pinnedEnabledModels adopts upstream #782: a connection with a pinned model
+// list already publishes exactly that list, so a live catalog adds nothing.
+func pinnedEnabledModels(cd *shared.ConnectionData) bool {
+	if cd == nil || cd.ProviderSpecificData == nil {
+		return false
+	}
+	switch v := cd.ProviderSpecificData["enabledModels"].(type) {
+	case []any:
+		return len(v) > 0
+	case []string:
+		return len(v) > 0
+	}
+	return false
+}
+
 // resolveLiveCatalog returns the live catalog for a provider connection from
 // the cache layers ONLY — the in-memory store, then the KV copy written by the
 // last refresh (dashboard sync or the daily background job). It NEVER fetches:
@@ -102,13 +134,30 @@ var liveCatalogFlight singleflight.Group
 // src/app/api/v1/models/route.js), which fetches in the request path: this
 // build moves discovery to POST /api/models/live-catalog/refresh and
 // StartBackgroundLiveCatalogRefresh.
+// Pinned connections (upstream d329f9f4): a connection with pinned models
+// already publishes exactly that list, so a live catalog cannot add anything —
+// and fetching it once per combo leaf is what made /v1/models take minutes at
+// thousands of connections.
+// pinnedEnabledModels reports whether the operator pinned a model list on the
+// connection.
 func (h *ChatHandler) resolveLiveCatalog(ctx context.Context, conn *models.ProviderConnection, connData *shared.ConnectionData, providerID string) []LiveModel {
 	if conn == nil || connData == nil {
+		return nil
+	}
+	if pinnedEnabledModels(connData) {
 		return nil
 	}
 	if !hasLiveCatalogResolver(providerID) {
 		return nil
 	}
+	accessToken := connData.AccessToken
+	if accessToken == "" {
+		accessToken = connData.APIKey
+	}
+	if accessToken == "" {
+		return nil
+	}
+
 	cacheKey := liveCatalogKey(providerID, conn, connData)
 	if cached, ok := liveCatalogCached(cacheKey); ok {
 		return cached
@@ -164,6 +213,12 @@ func liveCatalogStoreModels(key string, discovered []LiveModel) {
 	liveCatalogStore.mu.Lock()
 	defer liveCatalogStore.mu.Unlock()
 	liveCatalogStore.entries[key] = liveCatalogEntry{expiresAt: time.Now().Add(liveCatalogTTL), models: discovered}
+}
+
+func liveCatalogStoreNegative(key string) {
+	liveCatalogStore.mu.Lock()
+	defer liveCatalogStore.mu.Unlock()
+	liveCatalogStore.entries[key] = liveCatalogEntry{expiresAt: time.Now().Add(liveCatalogNegTTL)}
 }
 
 // ---- Kiro (AWS CodeWhisperer ListAvailableModels) ----

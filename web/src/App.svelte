@@ -34,13 +34,17 @@
   import Toasts from './lib/ui/Toasts.svelte'
   import TerminalView from './components/TerminalView.svelte'
   import TokenSaverView from './components/TokenSaverView.svelte'
+  import JailbreakView from './components/JailbreakView.svelte'
   import TopBar from './components/TopBar.svelte'
+  import CommandPalette from './components/CommandPalette.svelte'
   import { parseMediaProvider, parseProviderId, pathToTab, providerPath, mediaProviderPath, TAB_ROUTES, type ActiveTab, type MediaProviderRoute } from './lib/router'
   import { PROVIDER_CATALOG } from './lib/providers'
   import { getIconPath } from './components/connections/types'
-  import { isNavHidden, normalizeHiddenNav } from './lib/nav'
+  import { isNavHidden, NAV_ORDER, normalizeHiddenNav, normalizeNavOrder } from './lib/nav'
   import { setHiddenNavEntries } from './lib/navVisibility.svelte'
+  import { loadPinnedNavEntries } from './lib/navFavorites.svelte'
   import { setDisplayCurrency } from './lib/currency.svelte'
+  import { applyAnimationLevel } from './lib/displayPrefs'
 
   let activeTab = $state<ActiveTab>(
     typeof window !== 'undefined' ? pathToTab(window.location.pathname) : 'endpoint'
@@ -54,13 +58,19 @@
   // "this deployment stores no hide list" from "the list has not arrived yet".
   let settingsLoaded = $state(false)
 
-  // Feature Visibility: the entries the operator hid in Settings. The sidebar
-  // and this guard read the same list (web/src/lib/nav.ts).
+  // Feature Visibility: the entries the operator hid, and the arrangement they
+  // moved them into. The sidebar and this guard read the same settings
+  // (web/src/lib/nav.ts).
   let hiddenNav = $derived(normalizeHiddenNav(settings.navVisibility))
+  let navOrder = $derived(normalizeNavOrder(settings.navVisibility))
 
   // Mirror the list for the components that read it outside the settings flow
   // (the API-key editor drops its Plan field with the entry).
   $effect(() => setHiddenNavEntries(hiddenNav))
+  // The pinned entries are a per-operator localStorage preference, read once
+  // against this build's ids so an entry removed from nav.ts leaves no pin
+  // that renders nothing.
+  $effect(() => loadPinnedNavEntries(NAV_ORDER))
 
   // A hidden tab must not stay reachable by its own URL: the panel promises the
   // entry is gone, and a bookmark or a back navigation would otherwise reopen
@@ -82,6 +92,10 @@
   let requireLogin = $state(false)
   let isCreateComboOpen = $state(false)
   let isMobileMenuOpen = $state(false)
+  // The global search palette. Ctrl+K / Cmd+K anywhere in the dashboard opens
+  // it, which is why the listener lives here rather than in a component that
+  // would have to be mounted first.
+  let isPaletteOpen = $state(false)
   let selectedProviderId = $state<string | null>(
     typeof window !== 'undefined' ? parseProviderId(window.location.pathname) : null
   )
@@ -183,6 +197,17 @@
   }
 
   onMount(() => {
+    applyAnimationLevel()
+    // Ctrl+K / Cmd+K opens the search palette from anywhere in the dashboard.
+    // The guard on the modifier is what keeps a bare "k" from opening it while
+    // the operator types in a field.
+    function handlePaletteShortcut(event: KeyboardEvent) {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
+        event.preventDefault()
+        isPaletteOpen = !isPaletteOpen
+      }
+    }
+    window.addEventListener('keydown', handlePaletteShortcut)
     const unsubscribeUnauthorized = onUnauthorized(() => {
       isAuthenticatedState = false
       requireLogin = true
@@ -216,9 +241,30 @@
     }
     window.addEventListener('popstate', handlePopState)
 
+    // Tabs whose own content is drawn from `connections` / `providerNodes`.
+    // Every other tab (Usage, Quota, Token Saver, Settings, …) renders
+    // nothing from these lists, so the poll below would be re-fetching 28 KB
+    // every ten seconds for a page that cannot change.
+    const READS_CONNECTIONS: ActiveTab[] = [
+      'endpoint',
+      'connections',
+      'combos',
+      'proxy-pools',
+      'media-embedding',
+      'media-image',
+      'media-tts',
+      'media-stt',
+      'media-video',
+      'media-systemone',
+      'media-web',
+    ]
     const interval = setInterval(async () => {
       if (typeof document !== 'undefined' && document.hidden) return
       if (requireLogin && !isAuthenticatedState) return
+      // A tab that does not draw these lists gets them from the navigation
+      // that leaves it: `loadData()` runs on the way in, so the poll only has
+      // to keep an already-visible list fresh.
+      if (!READS_CONNECTIONS.includes(activeTab)) return
       try {
         const [connsRes, nodesRes] = await Promise.all([
           api.getConnections().catch(() => null),
@@ -234,11 +280,18 @@
     return () => {
       clearInterval(interval)
       window.removeEventListener('popstate', handlePopState)
+      window.removeEventListener('keydown', handlePaletteShortcut)
       unsubscribeUnauthorized()
     }
   })
 
   let activeConnectionsCount = $derived(connections.filter((c) => c.isActive === 1).length)
+  // Connections whose last probe or request failed. `lastError` is what the
+  // detail page reads, so the badge counts the same thing the operator would
+  // see there rather than a second opinion about health.
+  let failingConnections = $derived(
+    connections.filter((c) => c.isActive === 1 && !!c.lastError).length
+  )
   let selectedMediaCatalogItem = $derived.by(() => {
     if (!selectedMedia) return null
     return PROVIDER_CATALOG.find((p) => p.id === selectedMedia!.providerId) || null
@@ -284,6 +337,12 @@
     'console-log': { title: 'Console Log', description: 'Live server console output' },
     terminal: { title: 'Console Log', description: 'Live server console output' },
     settings: { title: 'Settings', description: 'Manage your preferences and configuration' },
+    security: {
+      title: 'Security',
+      description: 'Encrypt provider credentials at rest, and scan prompts for personal data and injection attempts before they leave the gateway',
+    },
+    plans: { title: 'Plans', description: 'Per-key quota plans and policy resolution' },
+    jailbreak: { title: 'Persona', description: 'Per-model system-prompt injection and Gemini safety bypass' },
   }
 
   function handleOpenNewCombo() {
@@ -330,8 +389,14 @@
     {/if}
 
     <!-- Left Sidebar -->
+    <!-- z-50 is the mobile drawer's layer, above its backdrop at z-40. On
+         desktop the wrapper returns to normal flow (lg:static), and an index
+         there made it a sibling stacking context above the content column:
+         every dialog opened inside <main> painted underneath the sidebar and
+         lost its left edge (issue #729). lg:z-auto drops the index exactly
+         where the drawer becomes the static column. -->
     <div
-      class="fixed inset-y-0 left-0 z-50 lg:static transition-transform duration-300 transform lg:transform-none {isMobileMenuOpen
+      class="fixed inset-y-0 left-0 z-50 lg:static lg:z-auto transition-transform duration-300 transform lg:transform-none {isMobileMenuOpen
         ? 'translate-x-0'
         : '-translate-x-full lg:translate-x-0 pointer-events-none lg:pointer-events-auto'}"
     >
@@ -342,11 +407,17 @@
         }}
         activeConnections={activeConnectionsCount}
         totalConnections={connections.length}
+        comboCount={combos.length}
+        apiKeyCount={apiKeys.length}
+        failingConnections={failingConnections}
         onClose={() => (isMobileMenuOpen = false)}
         bind:showUpdateModal={isUpdateModalOpen}
         bind:updateInfo={systemUpdateInfo}
         bind:version={systemVersion}
         hiddenNav={hiddenNav}
+        navOrder={navOrder}
+        brandName={settings.appName || ''}
+        brandLogo={settings.appLogoUrl || ''}
       />
     </div>
 
@@ -355,6 +426,20 @@
       bind:isOpen={isUpdateModalOpen}
       updateInfo={systemUpdateInfo}
       currentVersion={systemVersion}
+    />
+    <!-- Global search: Ctrl+K / Cmd+K, or the button in the top bar. -->
+    <CommandPalette
+      bind:isOpen={isPaletteOpen}
+      onClose={() => (isPaletteOpen = false)}
+      onNavigate={(route) => {
+        // The palette hands back a route, not a tab: a model row points at the
+        // endpoint page and a provider row at the providers page, so the route
+        // is the only thing every row has in common.
+        window.history.pushState({}, '', route)
+        activeTab = pathToTab(route)
+        selectedProviderId = parseProviderId(route)
+        selectedMedia = parseMediaProvider(route)
+      }}
     />
 
     <!-- Main Viewport (TopBar + Scrollable Canvas) -->
@@ -373,6 +458,7 @@
           isAuthenticatedState = false
           navigate('login')
         }}
+        onOpenSearch={() => (isPaletteOpen = true)}
       />
 
       <main class="flex-1 overflow-y-auto custom-scrollbar p-6 lg:p-10">
@@ -590,6 +676,8 @@
               <SecurityPanel />
             {:else if activeTab === 'plans'}
               <PlansView />
+            {:else if activeTab === 'jailbreak'}
+              <JailbreakView />
             {/if}
           {/if}
         </div>

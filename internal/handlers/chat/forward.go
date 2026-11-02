@@ -3,7 +3,6 @@ package chat
 import (
 	"bytes"
 	"context"
-	json "9router/proxy/internal/fastjson"
 	"errors"
 	"fmt"
 	"io"
@@ -12,18 +11,28 @@ import (
 	"time"
 
 	"9router/proxy/internal/constants"
+	json "9router/proxy/internal/fastjson"
 	"9router/proxy/internal/guardrails"
 	"9router/proxy/internal/handlerutil"
-	"9router/proxy/internal/semanticcache"
 	"9router/proxy/internal/log"
 	"9router/proxy/internal/providers"
 	internalproxy "9router/proxy/internal/proxy"
 	"9router/proxy/internal/proxy/executor"
+	"9router/proxy/internal/semanticcache"
 	"9router/proxy/internal/shutdown"
 	"9router/proxy/internal/translator"
 )
 
 // forwardRequest sends the request to the upstream provider and streams/pipes the response.
+// upstreamClaude marks an upstream that answers in Claude Messages format (an
+// anthropic-compatible node, minimax-code); clientClaude marks a client whose
+// own wire is Claude Messages. Three combinations matter:
+//   - upstream Claude + client not Claude: the reply is translated to the
+//     client's Chat Completions shape (the executor's UpstreamClaude, for the
+//     providers without a custom executor).
+//   - upstream Claude + client Claude: frames are already the client's format
+//     and are relayed untouched.
+//   - neither: the historical OpenAI lanes, translateResponse as passed.
 func (h *ChatHandler) forwardRequest(
 	ctx context.Context,
 	w http.ResponseWriter,
@@ -38,6 +47,9 @@ func (h *ChatHandler) forwardRequest(
 	// directly for every provider without a custom executor — the assigned
 	// pool would look bound in the dashboard and never be used.
 	httpClient *http.Client,
+	provider string,
+	upstreamClaude bool,
+	clientClaude bool,
 ) error {
 	// A nil client means the caller had no connection context; the shared one
 	// is the only sensible default.
@@ -66,6 +78,14 @@ func (h *ChatHandler) forwardRequest(
 				}
 			}
 		}
+	}
+	// Nous Portal thinking dialect and attribution tags (upstream NOUS_ATTRIBUTION / PR #4770 / thinkingUnified)
+	body = providers.ApplyNousThinking(body, provider)
+	if apiKey != "" && providers.ShouldApplyNousAttribution(cfg.BaseURL) {
+		body = providers.ApplyNousAttribution(body)
+	}
+	if provider == "deepseek" {
+		body = executor.DowngradeJsonSchemaToJSONObject(body)
 	}
 	resp, err := internalproxy.ForwardOpenAI(ctx, httpClient, cfg, apiKey, body, isStream)
 	if err != nil {
@@ -96,14 +116,124 @@ func (h *ChatHandler) forwardRequest(
 		if !strings.HasPrefix(strings.ToLower(contentType), "text/event-stream") {
 			// Upstream returned non-streaming response (e.g. JSON error with 200 OK)
 			log.Warn("stream", "non-stream response", "contentType", contentType)
+			if upstreamClaude && !clientClaude {
+				return h.handleClaudeUpstreamJSON(ctx, w, resp.Body, metrics)
+			}
 			return h.handleJSONResponse(ctx, w, resp.Body, translateResponse, metrics)
 		}
 		// Wrap with SSE stall detection
 		stallReader := internalproxy.NewStallReaderWithContext(ctx, resp.Body, 0, "upstream")
 		bodyCloser = stallReader
+		if upstreamClaude && clientClaude {
+			// Claude client on a Claude upstream: the frames are already the
+			// client's format, so the passthrough lane relays them untouched.
+			return h.handleStreamResponse(ctx, w, stallReader, false, start, metrics)
+		}
+		if upstreamClaude {
+			// OpenAI client on a Messages upstream: translate every Claude
+			// event to an OpenAI chunk instead of relaying SSE the client
+			// cannot read.
+			return h.handleClaudeUpstreamStream(ctx, w, stallReader, start, metrics)
+		}
 		return h.handleStreamResponse(ctx, w, stallReader, translateResponse, start, metrics)
 	}
+	if upstreamClaude && !clientClaude {
+		return h.handleClaudeUpstreamJSON(ctx, w, resp.Body, metrics)
+	}
 	return h.handleJSONResponse(ctx, w, resp.Body, translateResponse, metrics)
+}
+
+// handleClaudeUpstreamJSON serves a non-streaming Claude Messages response to a
+// Chat Completions client. Translation only runs on a body that really is a
+// Claude Message; anything else (a gateway's error envelope, an OpenAI-shaped
+// reply) is relayed raw so the client — and the probe verdict — reads the
+// failure the upstream actually sent rather than an empty completion.
+func (h *ChatHandler) handleClaudeUpstreamJSON(ctx context.Context, w http.ResponseWriter, upstream io.Reader, metrics *streamMetrics) error {
+	body, err := io.ReadAll(io.LimitReader(upstream, constants.MaxUpstreamBodyBytes))
+	if err != nil {
+		return fmt.Errorf("read upstream response body: %w", err)
+	}
+	if internalproxy.LooksLikeSSE(body) {
+		// A Messages upstream answered stream:false with an event stream. Fold
+		// it into one chat.completion: translate each event to an OpenAI chunk,
+		// then aggregate the chunks the same way a forced-SSE OpenAI reply is.
+		var folded bytes.Buffer
+		state := &translator.ClaudeToOpenAIStreamState{Model: translator.RequestedModelFromContext(ctx)}
+		_ = internalproxy.ScanStream(bytes.NewReader(body), func(payload []byte) {
+			if out, terr := translator.TranslateClaudeChunkToOpenAI(payload, state); terr == nil {
+				folded.Write(out)
+			}
+		})
+		if aggregated, ok := sseToClaudeJSON(folded.Bytes()); ok {
+			body = aggregated
+		}
+	}
+	converted := body
+	if translator.IsClaudeMessageBody(body) {
+		if next, terr := translator.TranslateClaudeResponseToOpenAI(body); terr == nil {
+			converted = next
+		} else {
+			log.Warn("json", "claude response relayed untranslated", "error", terr)
+		}
+	}
+	return h.handleJSONResponse(ctx, w, bytes.NewReader(converted), false, metrics)
+}
+
+// handleClaudeUpstreamStream pipes a Claude Messages SSE stream to a Chat
+// Completions client, translating each event into an OpenAI chunk.
+func (h *ChatHandler) handleClaudeUpstreamStream(ctx context.Context, w http.ResponseWriter, upstream io.Reader, startTime time.Time, metrics *streamMetrics) error {
+	hw := internalproxy.NewHeartbeatWriter(ctx, w, 0)
+	defer func() { _ = hw.Close() }()
+	flusher := internalproxy.WriteSSEHeaders(hw)
+	// A Messages stream that omits `model` still has to echo one back, and the
+	// model the client asked for is the value that is actually true.
+	state := &translator.ClaudeToOpenAIStreamState{Model: translator.RequestedModelFromContext(ctx)}
+	done := false
+	err := internalproxy.ScanStream(upstream, func(payload []byte) {
+		if done {
+			return
+		}
+		if string(bytes.TrimSpace(payload)) == "[DONE]" {
+			done = true
+			return
+		}
+		out, terr := translator.TranslateClaudeChunkToOpenAI(payload, state)
+		if terr != nil {
+			log.Error("stream", "claude chunk translate error", "error", terr)
+			return
+		}
+		if len(out) == 0 {
+			return
+		}
+		if metrics.TTFT == 0 {
+			metrics.TTFT = time.Since(startTime).Milliseconds()
+		}
+		_, _ = metrics.ResponseBuf.Write(out)
+		if _, werr := hw.Write(out); werr != nil {
+			return
+		}
+		if flusher != nil {
+			flusher.Flush()
+		}
+		if bytes.Contains(out, []byte("[DONE]")) {
+			done = true
+		}
+	})
+	if state.Usage != nil {
+		translator.SetUsage(ctx, state.Usage)
+	}
+	if err != nil {
+		return err
+	}
+	if !done {
+		// The upstream drained without a terminal event: close the stream the
+		// way a natural finish would, so the client does not hang on the read.
+		_, _ = hw.Write([]byte("data: [DONE]\n\n"))
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+	return nil
 }
 
 // handleStreamResponse pipes SSE chunks from upstream to the client.
@@ -112,26 +242,41 @@ func (h *ChatHandler) handleStreamResponse(ctx context.Context, w http.ResponseW
 	// Claude client, so this branch is decided by the client format alone. It
 	// runs before the header write because the bridge owns its own writer.
 	if translator.NeedsResponsesBridge(ctx) {
-		// The bridge defers response.completed until the upstream's usage
-		// trailer arrives, so once that wait begins the generic six-minute
-		// stall window is far too generous: an upstream that never sends the
-		// trailer would hold the client that long. One stall reader sized to
-		// the deferral bound ends the wait in step with the watchdog.
-		stream := upstream
-		if pending := executor.PendingCompletionFlushTimeout; pending > 0 {
-			if body, ok := upstream.(io.ReadCloser); ok {
-				stream = internalproxy.NewStallReaderWithContext(ctx, body, pending, "upstream pending completion")
-			}
-		}
-		return executor.StreamChatToResponses(ctx, w, stream, startTime, &metrics.TTFT, &metrics.ResponseBuf)
+		// The bridge bounds its own wait for the deferred completion (see
+		// ResponsesBridge.CompletionPending and the completion watchdog), so a
+		// second deadline wrapped around the same read would only be a
+		// duplicate timer racing the first one to the same terminal event.
+		return executor.StreamChatToResponses(ctx, w, upstream, startTime, &metrics.TTFT, &metrics.ResponseBuf)
 	}
+
+	// Peek before the header write. A 200 whose stream opens with an error
+	// frame, an immediate EOF, keep-alives only, or a bare [DONE] carries no
+	// turn — but once `200 text/event-stream` is committed the failure can only
+	// be relayed: combo fallback is over and the account is billed and cooled
+	// down for a reply it never gave. Refusing here keeps the decision
+	// reversible, so the 502 travels back to the account/model loop.
+	//
+	// The returned reader replays the peeked bytes exactly, so a healthy stream
+	// reaches the client byte for byte.
+	_, replayed, peekErr := internalproxy.PeekFirstStreamEvent(ctx, upstream, 0)
+	if peekErr != nil {
+		return peekErr
+	}
+	upstream = replayed
 
 	hw := internalproxy.NewHeartbeatWriter(ctx, w, 0)
 	defer hw.Close()
 	flusher := internalproxy.WriteSSEHeaders(hw)
 
 	if !translate {
+		// Passthrough still repairs id-less tool-call fragments: a provider
+		// opening a new tool-call index without an id aborts strict
+		// OpenAI-compatible clients mid-turn (upstream 95c9d03e).
+		toolFill := internalproxy.NewStreamToolCallIDFill()
 		err := internalproxy.ScanStream(upstream, func(payload []byte) {
+			if patched, changed := toolFill.Fill(payload); changed {
+				payload = patched
+			}
 			if metrics.TTFT == 0 {
 				metrics.TTFT = time.Since(startTime).Milliseconds()
 			}
@@ -152,10 +297,16 @@ func (h *ChatHandler) handleStreamResponse(ctx context.Context, w http.ResponseW
 		return nil
 	}
 
-	sessionKey := fmt.Sprintf("stream-%d", time.Now().UnixNano())
+	sessionKey := translator.NewSessionKey("stream")
 	// Seed with requested model so message_start echoes client's model (decolua/9router#3693)
 	if reqModel := translator.RequestedModelFromContext(ctx); reqModel != "" {
 		translator.SeedStreamState(sessionKey, reqModel)
+	}
+	// Body-size input estimate seeded before the first chunk: the terminal
+	// usage block falls back to it when the upstream never reports usage, so
+	// the client's context meter still moves and auto-compact can fire.
+	if est := translator.PromptEstimateFromContext(ctx); est > 0 {
+		translator.SeedStreamPromptEstimate(sessionKey, est)
 	}
 	defer func() {
 		if endChunk := translator.EnsureStreamClosed(sessionKey); len(endChunk) > 0 {
@@ -191,7 +342,12 @@ func (h *ChatHandler) handleStreamResponse(ctx context.Context, w http.ResponseW
 	// A shutdown abort cuts the stream mid-way. End it with the same terminator
 	// a natural finish emits, so the client sees a clean [DONE] instead of a
 	// truncated stream (the stall reader already closed the upstream body).
+	// The terminal message_delta + message_stop go out BEFORE [DONE]: they may
+	// have been deferred waiting for a usage chunk that never came.
 	if shutdown.Fired() && !finished {
+		if endChunk := translator.EnsureStreamClosed(sessionKey); len(endChunk) > 0 {
+			_, _ = hw.Write(endChunk)
+		}
 		hw.Write([]byte("data: [DONE]\n\n"))
 		if flusher != nil {
 			flusher.Flush()
@@ -286,19 +442,13 @@ func sseToClaudeJSON(raw []byte) ([]byte, bool) {
 					if n, ok := fn["name"].(string); ok && n != "" {
 						if existing, _ := fEntry["name"].(string); existing == "" {
 							fEntry["name"] = n
-						} else if existing != n && !strings.Contains(existing, n) {
+						} else {
 							fEntry["name"] = existing + n
 						}
 					}
 					if a, ok := fn["arguments"].(string); ok && a != "" {
 						existing, _ := fEntry["arguments"].(string)
-						if existing == "" {
-							fEntry["arguments"] = a
-						} else if existing != a && !strings.Contains(existing, a) {
-							if len(a) > 0 && !strings.HasSuffix(existing, a) {
-								fEntry["arguments"] = existing + a
-							}
-						}
+						fEntry["arguments"] = existing + a
 					}
 				}
 			}
@@ -380,11 +530,12 @@ func (h *ChatHandler) handleJSONResponse(ctx context.Context, w http.ResponseWri
 		body = folded
 	}
 
-	// A 200 that carries no completion (blank body, HTML error page, a
-	// `{"error": ...}` envelope, a choice with empty content) reads to every
-	// layer above as a served turn, which both ends combo fallback and
-	// clears the account cooldown. Report it as the 502 it is.
-	if err := internalproxy.EmptyUpstreamError(body); err != nil {
+	if armed, canFallback := internalproxy.ZeroContentProbe(ctx); armed && internalproxy.IsZeroContentResponse(body) {
+		if canFallback {
+			return &internalproxy.ZeroContentError{Body: body}
+		}
+		// The last member of a combo serves its zero-content response normally (FR3).
+	} else if err := internalproxy.EmptyUpstreamError(body); err != nil {
 		return err
 	}
 

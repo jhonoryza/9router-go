@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"regexp"
@@ -13,19 +14,30 @@ import (
 
 const (
 	// DefaultOpenCodeUA is the official OpenCode fingerprint User-Agent.
-	// OpenCode v2 fingerprint required by the free-tier /inference/v1 API.
-	DefaultOpenCodeUA = "opencode/latest/2.0.29/cli"
+	// OpenCode v2 fingerprint required by the free-tier /inference/openai/v1 API.
+	DefaultOpenCodeUA = "opencode/latest/2.1.4/cli"
 
 	// DefaultOpenCodeV1UA is the pre-v2 identity kept by the keyed lanes
 	// (opencode-zen, opencode-go): upstream decolua/9router#4842 moves only
 	// the keyless free executor to v2 and leaves every keyed executor on v1.
-	DefaultOpenCodeV1UA = "opencode/1.18.31"
+	DefaultOpenCodeV1UA = "opencode/1.19.4"
 
 	base62Chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 )
 
 // OpenCodeSessionRegex matches canonical OpenCode session IDs: ses_ + 12 hex + 14 Base62 (30 chars).
 var OpenCodeSessionRegex = regexp.MustCompile(`^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$`)
+
+// OpenCodeSessionDescendingRegex matches the time half of a session id the
+// upstream free tier accepts. The gate decodes the 12 hex digits and only
+// admits the descending layout the official CLI mints with
+// Identifier.descending() — ~(ts_ms<<12|counter), whose low 12 bits read
+// 0xFFF-counter — with counter 1–63, i.e. low 12 bits 0xfc0–0xfff. A ses_ id
+// with any other encoding (ascending timestamp, sha256 digest, random hex) is
+// refused with 403 FreeTierError even though its shape is canonical
+// (opencode2api descendingTimePartPattern; dsh-our-free-model measured
+// 2026-10-17).
+var OpenCodeSessionDescendingRegex = regexp.MustCompile(`^[0-9a-f]{9}f[c-f][0-9a-f]$`)
 
 // OpenCodeRequestRegex matches canonical OpenCode request IDs: msg_ + 12 hex + 14 Base62 (30 chars).
 var OpenCodeRequestRegex = regexp.MustCompile(`^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$`)
@@ -48,6 +60,96 @@ func unstableRandomBase62(n int) string {
 // (decolua/9router#4842 descendingTimeHex).
 func GenerateOpenCodeSessionID() string {
 	return "ses_" + descendingTimeHex(uint64(time.Now().UnixMilli()), 1) + unstableRandomBase62(14)
+}
+
+// IsCanonicalOpenCodeSession reports whether id is a session the upstream free
+// tier accepts verbatim: the canonical ses_ shape AND the descending time
+// encoding. The gate rejects a shape-valid id whose time half it cannot decode
+// as the official client's descending layout, so such an id is re-encoded by
+// TranslateOpenCodeSessionID instead of being forwarded (dsh-our-free-model
+// sessionForConversation; opencode2api isOfficialSessionID).
+func IsCanonicalOpenCodeSession(id string) bool {
+	trimmed := strings.TrimSpace(id)
+	if !OpenCodeSessionRegex.MatchString(trimmed) {
+		return false
+	}
+	return OpenCodeSessionDescendingRegex.MatchString(trimmed[4:16])
+}
+
+// opencodeStableSessionTTL bounds how long an idle stable session is reused
+// before a fresh one is minted. A var so tests can shrink the window.
+var opencodeStableSessionTTL = 30 * time.Minute
+
+// opencodeStableSessionLimit bounds the stable-session map: at the limit the
+// oldest key is evicted. Eviction and expiry are lazy (checked on read), so no
+// background goroutine runs for this cache.
+const opencodeStableSessionLimit = 1024
+
+var (
+	opencodeStableMu       sync.Mutex
+	opencodeStableSessions = make(map[string]opencodeStableEntry)
+	opencodeStableOrder    []string
+)
+
+type opencodeStableEntry struct {
+	id       string
+	lastUsed time.Time
+}
+
+// StableOpenCodeSessionID returns one long-lived canonical session per key,
+// minted on first use and reused until it goes stale.
+//
+// The free tier accounts its quota per upstream session: minting a fresh
+// x-opencode-session on every request burns through that budget and surfaces
+// as 429 FreeUsageLimitError with a growing retry-after, while the official
+// CLI reuses one long-lived session per conversation (decolua/9router
+// stableSessionId; dsh-our-free-model sessionForConversation). Executors call
+// this with a per-connection key when the client sent no session of its own.
+//
+// An entry older than opencodeStableSessionTTL is recycled, so a connection
+// that idles out starts a fresh budget instead of inheriting an exhausted one.
+func StableOpenCodeSessionID(key string) string {
+	if key == "" {
+		key = "default"
+	}
+	now := time.Now()
+	opencodeStableMu.Lock()
+	defer opencodeStableMu.Unlock()
+	if entry, ok := opencodeStableSessions[key]; ok && now.Sub(entry.lastUsed) < opencodeStableSessionTTL {
+		entry.lastUsed = now
+		opencodeStableSessions[key] = entry
+		return entry.id
+	}
+	id := GenerateOpenCodeSessionID()
+	opencodeStableSessions[key] = opencodeStableEntry{id: id, lastUsed: now}
+	opencodeStableOrder = append(opencodeStableOrder, key)
+	for len(opencodeStableOrder) > opencodeStableSessionLimit {
+		oldest := opencodeStableOrder[0]
+		opencodeStableOrder = opencodeStableOrder[1:]
+		delete(opencodeStableSessions, oldest)
+	}
+	return id
+}
+
+// ExpireStableOpenCodeSession retires the stable session minted for key, but
+// only while it still holds id: a rotation that loses a race against an
+// already-rotated session must not discard the fresh budget that rotation
+// minted. It reports whether the entry was removed.
+func ExpireStableOpenCodeSession(key, id string) bool {
+	opencodeStableMu.Lock()
+	defer opencodeStableMu.Unlock()
+	entry, ok := opencodeStableSessions[key]
+	if !ok || entry.id != id {
+		return false
+	}
+	delete(opencodeStableSessions, key)
+	for i, k := range opencodeStableOrder {
+		if k == key {
+			opencodeStableOrder = append(opencodeStableOrder[:i], opencodeStableOrder[i+1:]...)
+			break
+		}
+	}
+	return true
 }
 
 // descendingTimeHex renders the 12-hex session prefix: the low 48 bits of
@@ -73,61 +175,37 @@ func GenerateOpenCodeRequestID() string {
 	return "msg_" + hex.EncodeToString(timeBytes[:]) + unstableRandomBase62(14)
 }
 
-// opencodeSessionCache remembers one minted canonical session id per
-// downstream session, so a conversation keeps a stable id across turns
-// (decolua/9router#4791). Hashed ids fail the Zen v2 gate because their
-// prefix does not decode to a recent inverted timestamp.
-type opencodeSessionEntry struct {
-	id        string
-	expiresAt time.Time
-}
-
-var (
-	opencodeSessionMu     sync.Mutex
-	opencodeSessionCache  = map[string]opencodeSessionEntry{}
-	opencodeSessionMaxAge = time.Hour
-	opencodeSessionMaxLen = 1000
-)
-
-// TranslateOpenCodeSessionID maps foreign sessions to valid 30-char canonical
-// IDs. Ids that are already canonical pass through untouched; anything else
-// gets a freshly minted canonical id (GenerateOpenCodeSessionID), cached per
-// downstream session id + client tool so the same conversation maps to the
-// same upstream session until the entry expires.
 func TranslateOpenCodeSessionID(sessionID, clientTool string) string {
 	trimmed := strings.TrimSpace(sessionID)
-	if OpenCodeSessionRegex.MatchString(trimmed) {
+	if IsCanonicalOpenCodeSession(trimmed) {
 		return trimmed
 	}
 	tool := clientTool
 	if tool == "" {
 		tool = "generic"
 	}
-	key := tool + "\x00" + trimmed
-
-	now := time.Now()
-	opencodeSessionMu.Lock()
-	if entry, ok := opencodeSessionCache[key]; ok && now.Before(entry.expiresAt) {
-		id := entry.id
-		opencodeSessionMu.Unlock()
-		return id
+	h := sha256.New()
+	h.Write([]byte("opencode\x00" + tool + "\x00" + trimmed))
+	digest := h.Sum(nil)
+	// Keep the deterministic time component but pin the low 12 counter bits
+	// to the small value accepted by the OpenCode v2 free-tier gate.
+	timeValue := uint64(0)
+	for _, b := range digest[:5] {
+		timeValue = (timeValue << 8) | uint64(b)
 	}
-	id := GenerateOpenCodeSessionID()
-	if len(opencodeSessionCache) >= opencodeSessionMaxLen {
-		// Drop expired entries first; if still full, evict an arbitrary one.
-		for k, e := range opencodeSessionCache {
-			if !now.Before(e.expiresAt) {
-				delete(opencodeSessionCache, k)
-			}
-		}
-		for k := range opencodeSessionCache {
-			delete(opencodeSessionCache, k)
-			break
-		}
+	timeValue &= (uint64(1) << 36) - 1
+	current := timeValue*0x1000 + 1
+	var prefix [6]byte
+	for i := range 6 {
+		prefix[i] = byte((^current >> (40 - 8*uint64(i))) & 0xff)
 	}
-	opencodeSessionCache[key] = opencodeSessionEntry{id: id, expiresAt: now.Add(opencodeSessionMaxAge)}
-	opencodeSessionMu.Unlock()
-	return id
+	timeHex := hex.EncodeToString(prefix[:])
+	var sb strings.Builder
+	sb.Grow(14)
+	for i := 6; i < 20; i++ {
+		sb.WriteByte(base62Chars[int(digest[i])%62])
+	}
+	return "ses_" + timeHex + sb.String()
 }
 
 var opencodeUARegex = regexp.MustCompile(`(?i)^opencode/([a-z0-9-]+)/(\d+)\.(\d+)\.(\d+)/([a-z0-9-]+)$`)
@@ -229,7 +307,7 @@ func BuildOpenCodeHeaders(rawHeaders map[string]string, sessionID string, isStre
 				continue
 			}
 			hint := trimmed
-			if !OpenCodeSessionRegex.MatchString(hint) {
+			if !IsCanonicalOpenCodeSession(hint) {
 				hint = TranslateOpenCodeSessionID(hint, "")
 			}
 			// Upstream derives one session and mirrors it on all four

@@ -37,16 +37,16 @@ const (
 	// connectionProxyProbeTimeout mirrors the proxy pool test timeout.
 	connectionProxyProbeTimeout = 5 * time.Second
 
-	codexCLIVersion               = providers.CodexCLIVersion
-	grokCLIProbeURL               = "https://cli-chat-proxy.grok.com/v1/user"
-	grokCLIProbeUA                = providers.GrokCLIPagerUserAgent
-	kimchiProbeURL                = "https://api.cast.ai/v1/llm/openai/supported-providers"
-	kilocodeProbeURL              = "https://api.kilo.ai/api/profile"
-	clineProbeURL                 = "https://api.cline.bot/api/v1/users/me"
-	googleUserinfoURL             = "https://www.googleapis.com/oauth2/v1/userinfo?alt=json"
-	codexProbeURL                 = "https://chatgpt.com/backend-api/codex/responses"
-	cloudCodeAssistProbeURL       = "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
-	cloudCodeAssistProbeBody      = `{"metadata":{"ideType":"IDE_UNSPECIFIED","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}}`
+	codexCLIVersion          = providers.CodexCLIVersion
+	grokCLIProbeURL          = "https://cli-chat-proxy.grok.com/v1/user"
+	grokCLIProbeUA           = providers.GrokCLIPagerUserAgent
+	kimchiProbeURL           = "https://api.cast.ai/v1/llm/openai/supported-providers"
+	kilocodeProbeURL         = "https://api.kilo.ai/api/profile"
+	clineProbeURL            = "https://api.cline.bot/api/v1/users/me"
+	googleUserinfoURL        = "https://www.googleapis.com/oauth2/v1/userinfo?alt=json"
+	codexProbeURL            = "https://chatgpt.com/backend-api/codex/responses"
+	cloudCodeAssistProbeURL  = "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
+	cloudCodeAssistProbeBody = `{"metadata":{"ideType":"IDE_UNSPECIFIED","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}}`
 	// Meta's Model API lists its own catalogue for the credential that is
 	// being tested, which is the same call the dashboard's live-model import
 	// makes — a 401/403 is the only invalid answer. This is the Muse Code
@@ -197,11 +197,11 @@ var oauthProbeConfigs = map[string]oauthProbeConfig{
 		},
 		method: http.MethodGet, noAuth: true,
 	},
-	"kiro":           {checkExpiry: true, refreshable: true},
-	"qoder":          {url: "https://openapi.qoder.sh/api/v1/userinfo", method: http.MethodGet, authHeader: "Authorization", authPrefix: "Bearer "},
-	"qoder-cn":       {url: "https://openapi.qoder.com.cn/api/v1/userinfo", method: http.MethodGet, authHeader: "Authorization", authPrefix: "Bearer "},
-	"kimi":           {checkExpiry: true, refreshable: true},
-	"kimi-coding":    {checkExpiry: true, refreshable: true},
+	"kiro":        {checkExpiry: true, refreshable: true},
+	"qoder":       {url: "https://openapi.qoder.sh/api/v1/userinfo", method: http.MethodGet, authHeader: "Authorization", authPrefix: "Bearer "},
+	"qoder-cn":    {url: "https://openapi.qoder.com.cn/api/v1/userinfo", method: http.MethodGet, authHeader: "Authorization", authPrefix: "Bearer "},
+	"kimi":        {checkExpiry: true, refreshable: true},
+	"kimi-coding": {checkExpiry: true, refreshable: true},
 	// MiniMax Code publishes its own catalogue on the agent gateway, so the
 	// probe proves the credential the same way the quota read does — and the
 	// token is refreshable, unlike the API-key MiniMax providers.
@@ -219,6 +219,15 @@ var oauthProbeConfigs = map[string]oauthProbeConfig{
 			"x-api-version": "1.0.0",
 		},
 	},
+	"nous": {
+		url:          providers.NousChatCompletionsURL,
+		method:       http.MethodPost,
+		authHeader:   "Authorization",
+		authPrefix:   "Bearer ",
+		extraHeaders: map[string]string{"Content-Type": "application/json"},
+		body:         `{"model":"` + providers.NousValidationModel + `","messages":[{"role":"user","content":"` + probeMessageContent + `"}],"max_tokens":1,"stream":false}`,
+		refreshable:  true,
+	},
 	"cursor":         {tokenExists: true},
 	"kilocode":       {url: kilocodeProbeURL, method: http.MethodGet, authHeader: "Authorization", authPrefix: "Bearer "},
 	"cline":          {refreshable: true},
@@ -227,7 +236,8 @@ var oauthProbeConfigs = map[string]oauthProbeConfig{
 	"gitlab":         {url: "https://gitlab.com/api/v4/user", method: http.MethodGet, authHeader: "Authorization", authPrefix: "Bearer "},
 	"codebuddy-cn":   {tokenExists: true},
 	"codebuddy-intl": {tokenExists: true},
-	"zed":            {tokenExists: true},
+	// The stored credential only authorizes the account API; model access
+	// needs a minted LLM token, so the test walks both layers (probeZed).
 	"windsurf":       {tokenExists: true},
 	"trae":           {tokenExists: true},
 	"devin":          {tokenExists: true},
@@ -340,7 +350,7 @@ func (h *DashboardHandler) testSingleConnection(ctx context.Context, conn *model
 		}
 	}
 
-	if conn.AuthType == "apikey" || conn.AuthType == "cookie" || conn.AuthType == "compatible" {
+	if conn.AuthType == "apikey" || conn.AuthType == "cookie" || conn.AuthType == "compatible" || conn.AuthType == "none" || (conn != nil && providers.KnownProviders[providers.ResolveAlias(conn.Provider)].NoAuth) {
 		return h.probeAPIKeyConnection(ctx, conn, data, raw, client)
 	}
 	return h.probeOAuthConnection(ctx, conn, data, client)
@@ -479,7 +489,14 @@ func (h *DashboardHandler) probeAPIKeyConnection(ctx context.Context, conn *mode
 	}
 
 	ctx = withProbeClient(ctx, client)
-	out := validateProviderKey(ctx, provider, cfg, data.APIKey, data.ProviderSpecificData)
+	psd := data.ProviderSpecificData
+	if psd == nil {
+		psd = make(map[string]any)
+	}
+	if data.DefaultModel != "" && psd["defaultModel"] == nil {
+		psd["defaultModel"] = data.DefaultModel
+	}
+	out := validateProviderKey(ctx, provider, cfg, data.APIKey, psd)
 	if !out.supported {
 		return probeOutcome{message: "Provider test not supported"}
 	}
@@ -524,7 +541,7 @@ func (h *DashboardHandler) probeCompatibleConnection(ctx context.Context, conn *
 		body, _ := json.Marshal(map[string]any{
 			"model":      model,
 			"max_tokens": 1,
-			"messages":   []map[string]string{{"role": "user", "content": "test"}},
+			"messages":   []map[string]string{{"role": "user", "content": probeMessageContent}},
 		})
 		status, _, err := connectionProbeDo(ctx, client, http.MethodPost, anthropicProbeMessagesURL(base), map[string]string{
 			"x-api-key":         data.APIKey,
@@ -592,16 +609,22 @@ func (h *DashboardHandler) probeOAuthConnection(ctx context.Context, conn *model
 		return probeOutcome{valid: true}
 	}
 	accessToken := data.AccessToken
+	if provider == "nous" && data.APIKey != "" {
+		accessToken = data.APIKey
+	}
 	refreshed := false
 	var tokens *oauth.TokenResult
 
 	tokenExpired := connectionTokenExpired(provider, data)
 	if cfg.refreshable && tokenExpired && data.RefreshToken != "" {
-		tokens = h.refreshConnectionToken(ctx, provider, data, client)
+		tokens = h.refreshConnectionToken(ctx, conn.ID, provider, data, client)
 		if tokens == nil {
 			return probeOutcome{message: "Token expired and refresh failed"}
 		}
 		accessToken = tokens.AccessToken
+		if provider == "nous" && tokens.APIKey != "" {
+			accessToken = tokens.APIKey
+		}
 		refreshed = true
 	}
 
@@ -622,7 +645,7 @@ func (h *DashboardHandler) probeOAuthConnection(ctx context.Context, conn *model
 			return probeOutcome{valid: true, refreshed: refreshed, tokens: tokens}
 		}
 		if attempt.status == http.StatusUnauthorized && cfg.refreshable && !refreshed && data.RefreshToken != "" {
-			retryTokens := h.refreshConnectionToken(ctx, provider, data, client)
+			retryTokens := h.refreshConnectionToken(ctx, conn.ID, provider, data, client)
 			if retryTokens == nil || retryTokens.AccessToken == "" {
 				return probeOutcome{message: "Token invalid or revoked"}
 			}
@@ -634,24 +657,30 @@ func (h *DashboardHandler) probeOAuthConnection(ctx context.Context, conn *model
 		}
 		return probeOutcome{message: attempt.message, refreshed: refreshed, tokens: tokens}
 	case "cline", "clinepass":
-		return h.probeCline(ctx, data, client, accessToken, refreshed, tokens)
+		return h.probeCline(ctx, conn.ID, data, client, accessToken, refreshed, tokens)
+	case "zed":
+		return h.probeZed(ctx, data, client)
 	case "freebuff":
 		return h.probeFreebuff(ctx, conn, data, client)
 	}
 
-	return h.probeOAuthEndpoint(ctx, provider, cfg, client, accessToken, refreshed, tokens, data)
+	return h.probeOAuthEndpoint(ctx, conn.ID, provider, cfg, client, accessToken, refreshed, tokens, data)
 }
 
 // probeOAuthEndpoint runs the generic configured probe plus the 401 retry path.
-func (h *DashboardHandler) probeOAuthEndpoint(ctx context.Context, provider string, cfg oauthProbeConfig, client *http.Client, accessToken string, refreshed bool, tokens *oauth.TokenResult, data connectionProbeData) probeOutcome {
+func (h *DashboardHandler) probeOAuthEndpoint(ctx context.Context, connectionID, provider string, cfg oauthProbeConfig, client *http.Client, accessToken string, refreshed bool, tokens *oauth.TokenResult, data connectionProbeData) probeOutcome {
 	attempt := runOAuthProbe(ctx, cfg, client, accessToken, data)
 	if attempt.valid {
 		return probeOutcome{valid: true, message: attempt.message, refreshed: refreshed, tokens: tokens}
 	}
 	if attempt.status == http.StatusUnauthorized && cfg.refreshable && !refreshed && data.RefreshToken != "" {
-		retryTokens := h.refreshConnectionToken(ctx, provider, data, client)
+		retryTokens := h.refreshConnectionToken(ctx, connectionID, provider, data, client)
 		if retryTokens != nil {
-			retry := runOAuthProbe(ctx, cfg, client, retryTokens.AccessToken, data)
+			retryToken := retryTokens.AccessToken
+			if provider == "nous" && retryTokens.APIKey != "" {
+				retryToken = retryTokens.APIKey
+			}
+			retry := runOAuthProbe(ctx, cfg, client, retryToken, data)
 			if retry.valid {
 				return probeOutcome{valid: true, message: retry.message, refreshed: true, tokens: retryTokens}
 			}
@@ -662,7 +691,7 @@ func (h *DashboardHandler) probeOAuthEndpoint(ctx context.Context, provider stri
 }
 
 // probeCline ports the cline branch: probe users/me, refresh on 401, retry.
-func (h *DashboardHandler) probeCline(ctx context.Context, data connectionProbeData, client *http.Client, accessToken string, refreshed bool, tokens *oauth.TokenResult) probeOutcome {
+func (h *DashboardHandler) probeCline(ctx context.Context, connectionID string, data connectionProbeData, client *http.Client, accessToken string, refreshed bool, tokens *oauth.TokenResult) probeOutcome {
 	try := func(token string) probeOutcome {
 		// JWT-only workos: prefix (parity with upstream
 		// open-sse/shared/clineAuth.js): ClinePass API keys ride plain.
@@ -693,7 +722,7 @@ func (h *DashboardHandler) probeCline(ctx context.Context, data connectionProbeD
 	if initial.valid || initial.message != "Token invalid or revoked" || data.RefreshToken == "" {
 		return initial
 	}
-	retryTokens := h.refreshConnectionToken(ctx, "cline", data, client)
+	retryTokens := h.refreshConnectionToken(ctx, connectionID, "cline", data, client)
 	if retryTokens == nil || retryTokens.AccessToken == "" {
 		return probeOutcome{message: "Token invalid or revoked"}
 	}
@@ -896,23 +925,32 @@ func probeProviderErrorMessage(body []byte, fallback string) string {
 }
 
 // refreshConnectionToken refreshes a connection's OAuth token through the
-// shared refresher registry. A nil result means "cannot refresh", which the
-// callers surface exactly like upstream's failed refresh.
-func (h *DashboardHandler) refreshConnectionToken(ctx context.Context, provider string, data connectionProbeData, client *http.Client) *oauth.TokenResult {
+// shared refresher registry, holding a per-connection lock so two callers
+// can never race the same refresh token. A nil result means "cannot refresh",
+// which the callers surface exactly like upstream's failed refresh.
+func (h *DashboardHandler) refreshConnectionToken(ctx context.Context, connectionID, provider string, data connectionProbeData, client *http.Client) *oauth.TokenResult {
 	if data.RefreshToken == "" {
 		return nil
 	}
 	if client == nil {
 		client = &http.Client{Timeout: connectionProbeTimeout}
 	}
-	result, err := oauth.Refresh(ctx, &oauth.Params{
-		Client:               client,
-		Provider:             providers.ResolveAlias(provider),
-		RefreshToken:         data.RefreshToken,
-		AccessToken:          data.AccessToken,
-		ProviderSpecificData: oauth.StringMap(data.ProviderSpecificData),
+	var result *oauth.TokenResult
+	err := oauth.WithRefreshLock(connectionID, func() error {
+		res, err := oauth.Refresh(ctx, &oauth.Params{
+			Client:               client,
+			Provider:             providers.ResolveAlias(provider),
+			RefreshToken:         data.RefreshToken,
+			AccessToken:          data.AccessToken,
+			ProviderSpecificData: oauth.StringMap(data.ProviderSpecificData),
+		})
+		if err != nil || res == nil || res.AccessToken == "" {
+			return err
+		}
+		result = res
+		return nil
 	})
-	if err != nil || result == nil || result.AccessToken == "" {
+	if err != nil || result == nil {
 		return nil
 	}
 	return result
@@ -971,6 +1009,9 @@ func (h *DashboardHandler) persistProbeResult(conn *models.ProviderConnection, r
 		}
 		if out.tokens.ProjectID != "" {
 			raw["projectId"] = out.tokens.ProjectID
+		}
+		if out.tokens.APIKey != "" {
+			raw["apiKey"] = out.tokens.APIKey
 		}
 		if out.tokens.ExpiresIn > 0 {
 			raw["expiresIn"] = out.tokens.ExpiresIn
