@@ -15,6 +15,7 @@ import (
 	"9router/proxy/internal/handlerutil"
 	"9router/proxy/internal/middleware"
 	"9router/proxy/internal/observ"
+	"9router/proxy/internal/usagetracker"
 	"9router/proxy/web"
 	json "encoding/json/v2"
 	"github.com/go-chi/chi/v5"
@@ -56,6 +57,33 @@ func SetupRoutes(r interface {
 	if chatH != nil {
 		dashH.SemanticCache = chatH.SemanticCache
 		dashH.ChatHandler = chatH
+		// The resilience layer is owned by the data plane, because that is the
+		// side that consults it on every request. The dashboard holds the same
+		// instance so its panel reports the layer a request was judged
+		// against, not a second one that can disagree with it.
+		dashH.Resilience = chatH.Resilience
+		// The same instance feeds the usage SSE stream, so an operator watching
+		// the request flow sees an egress's breaker go OPEN beside the requests
+		// that stopped being served. The tracker takes a closure rather than
+		// the controller because it must not import the resilience package
+		// (see usagetracker.StreamPayload.Breakers).
+		usagetracker.GetTracker().SetBreakerStatus(func() []usagetracker.BreakerSnapshot {
+			if chatH.Resilience == nil {
+				return nil
+			}
+			breakers, _ := chatH.Resilience.Statuses()
+			out := make([]usagetracker.BreakerSnapshot, 0, len(breakers))
+			for _, b := range breakers {
+				out = append(out, usagetracker.BreakerSnapshot{
+					Name:         b.Name,
+					State:        string(b.State),
+					FailureCount: b.FailureCount,
+					SuccessCount: b.SuccessCount,
+					RetryAfterMs: b.RetryAfterMs,
+				})
+			}
+			return out
+		})
 	}
 	// Live catalog refresh: the only operator-facing fetch of a provider's
 	// live catalog — /v1/models answers from cache only (see
@@ -85,6 +113,7 @@ func SetupRoutes(r interface {
 
 	// Media, Audio, Video & Web Tools Domain
 	r.Post("/embeddings", mediaH.HandleEmbeddings)
+	r.Post("/rerank", mediaH.HandleRerank)
 	// /v1/responses needs model resolution, combos, account fallback and usage
 	// logging, none of which the media passthrough has, so it lives with the
 	// chat handlers — the same place /v1/messages does.
@@ -159,8 +188,13 @@ func SetupRoutes(r interface {
 	r.Get("/api/usage/chart", HandleUsageChart(repo))
 	r.Get("/api/usage/dashboard", HandleUsageDashboard(repo))
 	r.Get("/api/usage/request-details", HandleRequestDetails(repo))
+	r.Get("/api/usage/export", HandleUsageExport(repo))
 	r.Get("/api/usage/request-details/{id}", HandleRequestDetail(repo))
 	r.Get("/api/usage/providers", dashH.HandleGetUsageProviders)
+	// Usage per client API key. Registered before the {connectionId} route:
+	// chi matches in order, so a route added after it would be read as a
+	// connection id.
+	r.Get("/api/usage/api-keys", dashH.HandleGetUsageByAPIKey)
 	r.Get("/api/usage/{connectionId}", dashH.HandleGetConnectionUsage)
 	r.Get("/api/usage/{connectionId}/reset-credits", dashH.HandleListCodexResetCredits)
 	r.Post("/api/usage/{connectionId}/reset-credits/consume", dashH.HandleConsumeCodexResetCredit)
@@ -190,6 +224,9 @@ func SetupDashboardRoutes(r chi.Router, repo *db.Repo, chatH *chat.ChatHandler) 
 		// windows with, so the dashboard reports the same numbers the gate
 		// enforces instead of its own private view of them.
 		dashH.Limiter = chatH.RateLimiter
+		// Same instance as the resilience panel reads: the data plane owns the
+		// layer it consults on every request.
+		dashH.Resilience = chatH.Resilience
 	}
 	ssoH := sso.NewHandler(repo)
 
@@ -198,6 +235,11 @@ func SetupDashboardRoutes(r chi.Router, repo *db.Repo, chatH *chat.ChatHandler) 
 	r.Get("/api/providers/client", dashH.HandleGetProvidersClient)
 	r.Post("/api/connections", dashH.HandleCreateConnection)
 	r.Post("/api/providers/validate", dashH.HandleValidateProvider)
+	// The provider registry the dashboard renders its catalog from. Registered here as
+	// well as in dashboard.RegisterRoutes, because that table is mounted by tests
+	// only: a route added there alone is reachable in a unit test and 404s on the
+	// real server.
+	r.Get("/api/providers/catalog", dashH.HandleGetProviderCatalog)
 	r.Post("/api/providers/gemini-web/browser-login", dashH.HandleGeminiWebBrowserLogin)
 	r.Post("/api/providers/gemini-web/import-chrome", dashH.HandleGeminiWebImportChrome)
 	r.Post("/api/providers/deepseek-web/browser-login", dashH.HandleDeepSeekWebBrowserLogin)
@@ -220,8 +262,13 @@ func SetupDashboardRoutes(r chi.Router, repo *db.Repo, chatH *chat.ChatHandler) 
 	r.Get("/api/usage/chart", HandleUsageChart(repo))
 	r.Get("/api/usage/dashboard", HandleUsageDashboard(repo))
 	r.Get("/api/usage/request-details", HandleRequestDetails(repo))
+	r.Get("/api/usage/export", HandleUsageExport(repo))
 	r.Get("/api/usage/request-details/{id}", HandleRequestDetail(repo))
 	r.Get("/api/usage/providers", dashH.HandleGetUsageProviders)
+	// Usage per client API key. Registered before the {connectionId} route:
+	// chi matches in order, so a route added after it would be read as a
+	// connection id.
+	r.Get("/api/usage/api-keys", dashH.HandleGetUsageByAPIKey)
 	r.Get("/api/usage/{connectionId}", dashH.HandleGetConnectionUsage)
 
 	r.Get("/api/usage/{connectionId}/reset-credits", dashH.HandleListCodexResetCredits)
@@ -439,6 +486,10 @@ func mountOAuthRoutes(r interface {
 	Post(pattern string, handlerFn http.HandlerFunc)
 }, oauthH *oauth.OAuthHandler) {
 	r.Post("/api/oauth/{provider}/import", oauthH.HandleOAuthImport)
+	// MiniMax Code lease auth: probe the desktop broker, then create a
+	// connection that borrows the desktop app's sign-in.
+	r.Get("/api/oauth/{provider}/lease-status", oauthH.HandleLeaseStatus)
+	r.Post("/api/oauth/{provider}/lease-connect", oauthH.HandleLeaseConnect)
 	r.Get("/api/oauth/kiro/social-authorize", oauthH.HandleOAuthKiroSocialAuthorize)
 	r.Post("/api/oauth/kiro/social-exchange", oauthH.HandleOAuthKiroSocialExchange)
 	r.Post("/api/oauth/kiro/import", oauthH.HandleKiroImport)
@@ -525,6 +576,22 @@ func SetupServerRouter(r chi.Router, repo *db.Repo, ts *TokenSaverConfig) *chat.
 	r.Get("/media-providers/*", webH.ServeHTTP)
 	r.Get("/media-providers/web", webH.ServeHTTP)
 	r.Get("/connections", webH.ServeHTTP)
+	// Provider share link: a fragment-only URL that the dashboard SPA resolves.
+	// Registered here, not under /dashboard/*, because the receiver may not have
+	// a session yet — the SPA gates the write itself and preserves the fragment
+	// across the login redirect. The fragment never reaches the server, so a key
+	// embedded in the link is never logged.
+	//
+	// The pattern is "/add", not "/v1/add": RequestLogger
+	// (internal/middleware/logging.go:70-77) strips a leading /v1/ from
+	// req.URL.Path before the router sees it, so a "/v1/add" pattern would never
+	// match. /v1/add still reaches this handler — the prefix is virtual, which
+	// is why every engine route is registered twice below.
+	//
+	// It also must not go into SetupRoutes: that whole group is mounted inside
+	// RequireApiKey (router.go:627-631), so an add route registered there would
+	// answer 401 to the browser that is supposed to open it.
+	r.Get("/add", webH.ServeHTTP)
 	r.Get("/combos", webH.ServeHTTP)
 	r.Get("/analytics", webH.ServeHTTP)
 	r.Get("/terminal", webH.ServeHTTP)
@@ -553,6 +620,7 @@ func SetupServerRouter(r chi.Router, repo *db.Repo, ts *TokenSaverConfig) *chat.
 	dashH := dashboard.NewDashboardHandler(repo, ts)
 	if versionH != nil {
 		dashH.SemanticCache = versionH.SemanticCache
+		dashH.Resilience = versionH.Resilience
 	}
 	// Operator-supplied dashboard assets (the white-label logo). Behind the
 	// same page gate as /dashboard/*, so an install that requires a login does
@@ -614,6 +682,10 @@ func SetupServerRouter(r chi.Router, repo *db.Repo, ts *TokenSaverConfig) *chat.
 	// The plan tier (F-3) is resolved from the repository, so a plan change
 	// applies to the next request without a restart.
 	rateLimiter.SetPlanSource(repo)
+	// The per-period budget (F-2) measures its spend from the same ledger the
+	// Usage dashboard reads, so the ceiling and the dashboard cannot disagree
+	// about what a key has spent.
+	rateLimiter.SetBudgetReader(repo)
 	// The fallback itself is read per request, so an operator can raise or drop
 	// a global default without a restart. Only the window, which the live
 	// windows already depend on, is pinned at boot.

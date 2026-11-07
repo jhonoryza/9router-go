@@ -9,6 +9,7 @@ import (
 	"9router/proxy/internal/middleware"
 	"9router/proxy/internal/modelhealth"
 	"9router/proxy/internal/observ"
+	"9router/proxy/internal/resilience"
 	"9router/proxy/internal/semanticcache"
 	"github.com/go-chi/chi/v5"
 )
@@ -30,6 +31,11 @@ type DashboardHandler struct {
 	// dashboard and engine share the process. The live-catalog refresh needs
 	// it because discovery (kiro / grok-cli / compatible nodes) lives there.
 	ChatHandler *chat.ChatHandler
+	// Resilience is the provider-level admission control the data plane
+	// consults. Held here so the dashboard reports the same layer a request was
+	// judged against rather than a second estimate that can drift from it. Nil
+	// when the handler was built outside a boot (tests, tooling).
+	Resilience *resilience.Controller
 	// Limiter is the process-wide rate limiter, shared with the data plane so the
 	// dashboard reports the same provider windows the dispatch gate enforces. It
 	// is optional: a handler built outside a boot (tests, tooling) has none, and
@@ -107,6 +113,10 @@ func RegisterRoutes(r chi.Router, h *DashboardHandler) {
 		r.Get("/providers/{id}/overrides", h.HandleGetProviderOverrides)
 		r.Put("/providers/{id}/overrides", h.HandleSaveProviderOverrides)
 		r.Post("/providers/validate", h.HandleValidateProvider)
+		// The provider registry is the single source of truth for the dashboard's
+		// catalog (category, icon, colour, auth type, service kinds), so the SPA
+		// fetches it instead of shipping a second copy that can drift.
+		r.Get("/providers/catalog", h.HandleGetProviderCatalog)
 
 		// Provider Nodes (Custom Endpoints)
 		r.Get("/provider-nodes", h.HandleGetProviderNodes)
@@ -237,6 +247,10 @@ func RegisterRoutes(r chi.Router, h *DashboardHandler) {
 		r.Post("/tunnel/tailscale-disable", h.HandleTailscaleDisable)
 		// Usage & Quotas
 		r.Get("/usage/providers", h.HandleGetUsageProviders)
+		// Usage per client API key. Registered before the {connectionId}
+		// route: chi matches in order, so a route added after it would be
+		// read as a connection id.
+		r.Get("/usage/api-keys", h.HandleGetUsageByAPIKey)
 		r.Get("/usage/{connectionId}", h.HandleGetConnectionUsage)
 		// Codex reset credits. These sit one segment deeper than the
 		// per-connection usage route, so chi matches them without the static
@@ -249,6 +263,8 @@ func RegisterRoutes(r chi.Router, h *DashboardHandler) {
 		r.Post("/usage/{connectionId}/glm-reset-cards", h.HandleRedeemGLMResetCard)
 
 		// Cache Analytics & Management
+		r.Get("/resilience", h.HandleGetResilience)
+		r.Post("/resilience/reset", h.HandleResetResilience)
 		r.Get("/cache", h.HandleGetCache)
 		r.Delete("/cache", h.HandleDeleteCache)
 		r.Get("/cache/entries", h.HandleGetCacheEntries)

@@ -370,6 +370,11 @@ var goOnlyColumns = [][3]string{
 	// wait for a concurrency slot before it is refused.
 	{"apiKeys", "tokenQuota", "INTEGER DEFAULT 0"},
 	{"apiKeys", "queueTimeoutMs", "INTEGER DEFAULT 0"},
+	// Per-key context ceiling: the largest context window one request from this
+	// key may use, in tokens. 0 means the model's own declared window applies.
+	// A different axis from tokenQuota, which bounds what the key may spend
+	// over its whole life.
+	{"apiKeys", "contextLimit", "INTEGER DEFAULT 0"},
 	// F-6 Argon2id key hashing
 	{"apiKeys", "keyHash", "TEXT DEFAULT ''"},
 	{"apiKeys", "lookupHash", "TEXT DEFAULT ''"},
@@ -394,6 +399,20 @@ var goOnlyColumns = [][3]string{
 	{"usageHistory", "clientKey", "TEXT DEFAULT ''"},
 	// F-3 Plans: reusable policy template
 	{"apiKeys", "planId", "TEXT DEFAULT ''"},
+	// F-2 Budget enforcement: per-period spend ceiling. The plans table
+	// carries the same fields for a plan template; these columns let one key
+	// override its plan, the same precedence rateLimitRPM already uses.
+	// limitMicros is USD micros (integer) so no float rounding can let a key
+	// overdraw; limitTokens is prompt+completion tokens in the period.
+	// budgetPeriod is daily|weekly|monthly|total, alertPct is the spend
+	// percentage at which X-Budget-Status is raised, and hardCutoff refuses
+	// with 402 once the period budget is spent. 0/"" means "not set", which
+	// is what leaves the plan's value (or no budget) in charge.
+	{"apiKeys", "limitMicros", "INTEGER DEFAULT 0"},
+	{"apiKeys", "limitTokens", "INTEGER DEFAULT 0"},
+	{"apiKeys", "budgetPeriod", "TEXT DEFAULT ''"},
+	{"apiKeys", "alertPct", "INTEGER DEFAULT 0"},
+	{"apiKeys", "hardCutoff", "INTEGER DEFAULT 0"},
 	// Per-custom-provider capacity limits (docs/provider-limits-plan.md). These
 	// bound what one upstream endpoint tolerates, which is a different axis from
 	// the apiKeys limits above (what one caller may spend): a custom provider is

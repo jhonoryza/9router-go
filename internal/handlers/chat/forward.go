@@ -14,6 +14,7 @@ import (
 	json "9router/proxy/internal/fastjson"
 	"9router/proxy/internal/guardrails"
 	"9router/proxy/internal/handlerutil"
+	"9router/proxy/internal/jsonfence"
 	"9router/proxy/internal/log"
 	"9router/proxy/internal/providers"
 	internalproxy "9router/proxy/internal/proxy"
@@ -64,17 +65,16 @@ func (h *ChatHandler) forwardRequest(
 			body = sanitized
 		}
 	}
-	// OpenRouter strict pattern validation (PR #3665): strip malformed regex patterns
-	if strings.Contains(cfg.BaseURL, "openrouter.ai") {
-		var bodyMap map[string]any
-		if err := json.Unmarshal(body, &bodyMap); err == nil {
-			if tools, ok := bodyMap["tools"].([]any); ok && len(tools) > 0 {
-				if normalized, removed := translator.NormalizeToolSchemasForProvider("openrouter", tools); removed > 0 {
-					bodyMap["tools"] = normalized
-					log.Debug("tool_schema", "openrouter stripped invalid patterns", "removed", removed)
-					if newBody, err := json.Marshal(bodyMap); err == nil {
-						body = newBody
-					}
+	// Strict pattern validation: strip regex lookarounds and malformed patterns
+	// that OpenAI, DeepSeek, and strict JSON Schema validators reject with HTTP 400.
+	var bodyMap map[string]any
+	if err := json.Unmarshal(body, &bodyMap); err == nil {
+		if tools, ok := bodyMap["tools"].([]any); ok && len(tools) > 0 {
+			if normalized, removed := translator.NormalizeToolSchemasForProvider(provider, tools); removed > 0 {
+				bodyMap["tools"] = normalized
+				log.Debug("tool_schema", "stripped invalid patterns", "provider", provider, "removed", removed)
+				if newBody, err := json.Marshal(bodyMap); err == nil {
+					body = newBody
 				}
 			}
 		}
@@ -87,10 +87,32 @@ func (h *ChatHandler) forwardRequest(
 	if provider == "deepseek" {
 		body = executor.DowngradeJsonSchemaToJSONObject(body)
 	}
+	// Provider-level admission control. The breaker answers "is this provider
+	// healthy at all?" and the semaphore "may THIS account take another
+	// concurrent request?" — one dead provider must stop every account's
+	// traffic to it, and one busy account must not throttle the others. Both
+	// are consulted here, at the single point every OpenAI-compatible lane
+	// goes through, so no lane can quietly bypass them.
+	release, allowed := h.resilienceAdmit(ctx, provider, cfg)
+	if !allowed {
+		return &upstreamError{
+			StatusCode: http.StatusServiceUnavailable,
+			Body:       []byte(`{"error":{"message":"provider temporarily unavailable","type":"server_error"}}`),
+		}
+	}
 	resp, err := internalproxy.ForwardOpenAI(ctx, httpClient, cfg, apiKey, body, isStream)
 	if err != nil {
+		// A transport failure never produced a status, which counts for the
+		// breaker exactly as a 503 does: the provider did not answer.
+		release()
+		h.resilienceReport(provider, cfg, 0)
 		return fmt.Errorf("forward to upstream: %w", err)
 	}
+	// The status is the provider's verdict, so report it before the error is
+	// translated — only provider-level failures may charge the breaker, and a
+	// 401 or 429 says something about the account rather than the provider.
+	h.resilienceReport(provider, cfg, resp.StatusCode)
+	release()
 
 	var bodyCloser io.Closer = resp.Body
 	defer func() {
@@ -122,7 +144,7 @@ func (h *ChatHandler) forwardRequest(
 			return h.handleJSONResponse(ctx, w, resp.Body, translateResponse, metrics)
 		}
 		// Wrap with SSE stall detection
-		stallReader := internalproxy.NewStallReaderWithContext(ctx, resp.Body, 0, "upstream")
+		stallReader := internalproxy.NewStallReaderWithContext(ctx, resp.Body, cfg.ResolveStallTimeout(internalproxy.ResolveDefaultStallTimeout()), "upstream")
 		bodyCloser = stallReader
 		if upstreamClaude && clientClaude {
 			// Claude client on a Claude upstream: the frames are already the
@@ -209,6 +231,7 @@ func (h *ChatHandler) handleClaudeUpstreamStream(ctx context.Context, w http.Res
 			metrics.TTFT = time.Since(startTime).Milliseconds()
 		}
 		_, _ = metrics.ResponseBuf.Write(out)
+		metrics.NoteOutput(time.Now())
 		if _, werr := hw.Write(out); werr != nil {
 			return
 		}
@@ -283,6 +306,7 @@ func (h *ChatHandler) handleStreamResponse(ctx context.Context, w http.ResponseW
 			frame := append([]byte("data: "), payload...)
 			frame = append(frame, '\n', '\n')
 			metrics.ResponseBuf.Write(frame)
+			metrics.NoteOutput(time.Now())
 			_, _ = hw.Write(frame)
 			if flusher != nil {
 				flusher.Flush()
@@ -334,6 +358,7 @@ func (h *ChatHandler) handleStreamResponse(ctx context.Context, w http.ResponseW
 			metrics.TTFT = time.Since(startTime).Milliseconds()
 		}
 		metrics.ResponseBuf.Write(translated)
+		metrics.NoteOutput(time.Now())
 		hw.Write(translated)
 		if flusher != nil {
 			flusher.Flush()
@@ -528,6 +553,10 @@ func (h *ChatHandler) handleJSONResponse(ctx context.Context, w http.ResponseWri
 			return internalproxy.UpstreamFailure(http.StatusBadGateway, internalproxy.NoCompletionInStream)
 		}
 		body = folded
+	} else if leadingJSON, ok := extractLeadingJSONObject(body); ok {
+		// Defensive: some upstreams return a valid JSON object followed by a stray
+		// SSE frame (e.g. `{...}data: [DONE]`) on non-streaming requests (#4733).
+		body = leadingJSON
 	}
 
 	if armed, canFallback := internalproxy.ZeroContentProbe(ctx); armed && internalproxy.IsZeroContentResponse(body) {
@@ -552,6 +581,13 @@ func (h *ChatHandler) handleJSONResponse(ctx context.Context, w http.ResponseWri
 		return guardrailBlockedError()
 	}
 	body = filtered
+	// A model asked for machine-readable JSON may still answer with a ```json
+	// fence. Unwrap it here — after the guardrail has seen the model's own
+	// words, before either write path hands bytes to the client — so the
+	// unwrapped body is what the cache stores and what both the OpenAI and
+	// Claude write paths send. Only a body whose contents parse as JSON is
+	// unwrapped, and only for a request that asked for JSON.
+	body = jsonfence.ApplyContents(ctx, body)
 
 	// A /v1/responses client on a Chat Completions upstream needs the answer in
 	// the Responses shape; translate marks a Claude client, which it is not.
@@ -619,6 +655,17 @@ func (h *ChatHandler) respondAsResponses(ctx context.Context, w http.ResponseWri
 			body = aggregated
 		}
 	}
+	// The aggregated body is itself the error when the stream carried one:
+	// sseToClaudeJSON folds a failing SSE frame into {"error":{...}}. That
+	// envelope must not reach ChatResponseToResponses, which reads the absent
+	// choices as an empty turn and answers status:"completed" with an empty
+	// output — a 200 for what was a 429 or a 502 (upstream v0.5.112, 56dbf46).
+	//
+	// handleJSONResponse already guards the Chat Completions path via
+	// EmptyUpstreamError; this bridge wrote 200 directly and had no such gate.
+	if err := internalproxy.EmptyUpstreamError(body); err != nil {
+		return err
+	}
 	converted, err := translator.ChatResponseToResponses(body)
 	if err == nil {
 		if usage := translator.ParseResponseUsage(body); usage != nil {
@@ -632,4 +679,54 @@ func (h *ChatHandler) respondAsResponses(ctx context.Context, w http.ResponseWri
 	w.WriteHeader(http.StatusOK)
 	w.Write(body)
 	return nil
+}
+
+// extractLeadingJSONObject extracts the first balanced top-level JSON object from a byte slice
+// that may have trailing SSE framing (e.g. `{...}data: [DONE]\n\n`). Upstream #5384 (#4733).
+func extractLeadingJSONObject(b []byte) ([]byte, bool) {
+	start := bytes.IndexByte(b, '{')
+	if start == -1 {
+		return nil, false
+	}
+	depth := 0
+	inString := false
+	escaped := false
+
+	for i := start; i < len(b); i++ {
+		ch := b[i]
+		if escaped {
+			escaped = false
+			continue
+		}
+		if ch == '\\' {
+			escaped = true
+			continue
+		}
+		if ch == '"' {
+			inString = !inString
+			continue
+		}
+		if inString {
+			continue
+		}
+		switch ch {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				candidate := b[start : i+1]
+				var check any
+				if json.Unmarshal(candidate, &check) == nil {
+					// Only report stripped if there actually was trailing content
+					if i+1 < len(b) && len(bytes.TrimSpace(b[i+1:])) > 0 {
+						return candidate, true
+					}
+					return nil, false
+				}
+				return nil, false
+			}
+		}
+	}
+	return nil, false
 }

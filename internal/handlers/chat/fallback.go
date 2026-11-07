@@ -19,6 +19,7 @@ import (
 	json "encoding/json/v2"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"regexp"
 	"slices"
@@ -173,6 +174,21 @@ func (h *ChatHandler) handleAccountFallback(
 			}
 			allConns = h.applyConnectionStrategy(allConns, effectiveStrat)
 		}
+	}
+
+	var seatBudgetMs int
+	if h.Repo != nil {
+		if settings, err := h.Repo.GetSettings(); err == nil && settings != nil {
+			seatBudgetMs = settings.SeatAttemptBudgetMs
+			if settings.ProviderOverrides != nil {
+				if ov, ok := settings.ProviderOverrides[provider]; ok && ov.SeatBudgetMs > 0 {
+					seatBudgetMs = ov.SeatBudgetMs
+				}
+			}
+		}
+	}
+	if seatBudgetMs > 0 {
+		ctx = internalproxy.WithSeatBudget(ctx, seatBudgetMs)
 	}
 
 	var excludeIDs []string
@@ -529,6 +545,25 @@ type forwardRequestParams struct {
 	Endpoint          string
 }
 
+// streamNoteWriter wraps an io.Writer and stamps each non-empty write with the
+// current time via note, so every streamed chunk is timed for gap/rate metrics.
+// A nil note is a no-op.
+type streamNoteWriter struct {
+	w    io.Writer
+	note func(time.Time)
+}
+
+func (s *streamNoteWriter) Write(p []byte) (int, error) {
+	if s == nil || s.w == nil {
+		return 0, nil
+	}
+	n, err := s.w.Write(p)
+	if n > 0 && s.note != nil {
+		s.note(time.Now())
+	}
+	return n, err
+}
+
 func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
 	ctx, w := f.Ctx, f.W
 	provider, model := f.Provider, f.Model
@@ -781,7 +816,7 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
 			accountFastOpt = &v
 		}
 	}
-	if fastBody, modified := ApplyCodexFastMode(pipedBody, provider, accountFastOpt); modified {
+	if fastBody, modified := ApplyCodexFastMode(ctx, pipedBody, provider, accountFastOpt); modified {
 		pipedBody = fastBody
 	}
 
@@ -802,6 +837,8 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
 		target := "openai"
 		switch {
 		case executor.UpstreamSpeaksResponses(provider, wireModel, providerCfg):
+			target = "openai-responses"
+		case executor.IsCopilotResponsesModel(provider, wireModel):
 			target = "openai-responses"
 		case isAnthropic || upstreamClaude:
 			// A provider whose own endpoint speaks the Messages format
@@ -846,6 +883,12 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
 	// neither field, so the normalizer is a no-op there.
 	if !claudeNative && !upstreamClaude && !executor.UpstreamSpeaksResponses(provider, wireModel, providerCfg) {
 		pipedBody = normalizeChatTokenFields(pipedBody)
+	}
+
+	// Strict pattern validation: strip regex lookarounds and malformed patterns
+	// that OpenAI, DeepSeek, and strict JSON Schema validators reject with HTTP 400.
+	if !claudeNative && !upstreamClaude {
+		pipedBody = sanitizeOutboundToolSchemas(pipedBody, provider)
 	}
 
 	start := time.Now()
@@ -925,6 +968,12 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
 	if providers.IsLocalByDesign(provider) {
 		ctx = internalproxy.WithAllowLoopback(ctx)
 	}
+	// Per-connection opt-in for private-network dials (issue #840): a connection
+	// pointed at a local gateway or LAN peer carries allowPrivateNetworking.
+	// The flag rides on ctx so the dial guard honors it for this request only.
+	if connData != nil && connData.AllowPrivateNetworking {
+		ctx = internalproxy.WithAllowPrivateNetworking(ctx)
+	}
 	sessionID := handlerutil.GetSessionID(ctx)
 
 	// The outbound guardrail tap goes here, not inside a response handler:
@@ -992,6 +1041,10 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
 	// before any executor or forwarding function writes headers to w.
 	injectRouteHeaders(w, provider, model, f.ComboName, f.Attempts)
 
+	// The context budget of the request that is about to be served, so a client
+	// can see how much of the window this turn used.
+	injectContextHeaders(w, resolveContextBudget(ctx, provider, model, pipedBody))
+
 	if exec := executor.Get(provider); exec != nil {
 		execReq := &executor.Request{
 			Ctx:            ctx,
@@ -1007,7 +1060,7 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
 			SessionID:      sessionID,
 			ToolNameMap:    claudeToolMap,
 			UpstreamClaude: upstreamClaude && !claudeNative,
-			ResponseBuf:    &metrics.ResponseBuf,
+			ResponseBuf:    &streamNoteWriter{w: &metrics.ResponseBuf, note: metrics.NoteOutput},
 			StartTime:      start,
 			TTFT:           &metrics.TTFT,
 		}
@@ -1055,7 +1108,7 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
 					SessionID:      sessionID,
 					ToolNameMap:    claudeToolMap,
 					UpstreamClaude: upstreamClaude && !claudeNative,
-					ResponseBuf:    &metrics.ResponseBuf,
+					ResponseBuf:    &streamNoteWriter{w: &metrics.ResponseBuf, note: metrics.NoteOutput},
 					StartTime:      start,
 					TTFT:           &metrics.TTFT,
 				}
@@ -1319,6 +1372,12 @@ func isClientCanceled(ctx context.Context, err error) bool {
 // a role:"system" message is rejected by the Anthropic API.
 // false from compress/inject means nothing changed (or unparseable) — keep original, not a failure.
 func (h *ChatHandler) applyTokenSavers(ctx context.Context, body []byte, claudeNative bool) ([]byte, int, int, int) {
+	// X-9Router-Token-Saver: off|0|false|bypass opts the whole request out of
+	// every token saver — RTK, Caveman, Ponytail, ADHD, Headroom, system prompt
+	// prefix/suffix — and the body is forwarded untouched with 0 tokens saved.
+	if TokenSaverBypassEnabled(ctx) {
+		return body, 0, 0, 0
+	}
 	if h.TokenSaver == nil {
 		return body, 0, 0, 0
 	}
@@ -1417,6 +1476,36 @@ func (h *ChatHandler) applyTokenSavers(ctx context.Context, body []byte, claudeN
 		}
 	}
 	return out, origTokens, savedTokens, savedPct
+}
+
+// tokenSaverBypassKey carries the X-9Router-Token-Saver opt-out on the context.
+type tokenSaverBypassKey struct{}
+
+// WithTokenSaverBypass marks ctx as a token-saver bypass: no compression or
+// prompt injection may run on this request.
+func WithTokenSaverBypass(ctx context.Context) context.Context {
+	return context.WithValue(ctx, tokenSaverBypassKey{}, true)
+}
+
+// TokenSaverBypassEnabled reports whether the request opted out of token saving.
+func TokenSaverBypassEnabled(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	v, ok := ctx.Value(tokenSaverBypassKey{}).(bool)
+	return ok && v
+}
+
+// isTokenSaverBypassValue reports whether an X-9Router-Token-Saver header value
+// opts the request out of every token saver (false, 0, off, bypass,
+// case-insensitive).
+func isTokenSaverBypassValue(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "false", "0", "off", "bypass":
+		return true
+	default:
+		return false
+	}
 }
 
 func resolveProtocol(endpoint string) string {
@@ -1812,4 +1901,25 @@ func isModelScopedError(statusCode int, errorText string, model string, bodies .
 	}
 
 	return false
+}
+
+func sanitizeOutboundToolSchemas(body []byte, provider string) []byte {
+	var bodyMap map[string]any
+	if err := json.Unmarshal(body, &bodyMap); err != nil {
+		return body
+	}
+	tools, ok := bodyMap["tools"].([]any)
+	if !ok || len(tools) == 0 {
+		return body
+	}
+	normalized, removed := translator.NormalizeToolSchemasForProvider(provider, tools)
+	if removed == 0 {
+		return body
+	}
+	bodyMap["tools"] = normalized
+	log.Debug("tool_schema", "stripped invalid patterns", "provider", provider, "removed", removed)
+	if newBody, err := json.Marshal(bodyMap); err == nil {
+		return newBody
+	}
+	return body
 }

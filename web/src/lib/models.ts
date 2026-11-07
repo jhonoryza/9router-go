@@ -14,6 +14,7 @@ export interface ProviderModel {
 }
 
 export const PROVIDER_ID_TO_ALIAS: Record<string, string> = {
+  "zcode": "zcode",
   "agnes": "agnes",
   "bai": "bai",
   "atria": "atria",
@@ -925,9 +926,7 @@ export const BUILTIN_MODELS_BY_PROVIDER: Record<string, ProviderModel[]> = {
     {
       "id": "@cf/black-forest-labs/flux-1-schnell",
       "name": "FLUX.1 Schnell",
-      "params": [
-        "size"
-      ],
+      "params": [],
       "kind": "image"
     },
     {
@@ -2278,6 +2277,16 @@ export const BUILTIN_MODELS_BY_PROVIDER: Record<string, ProviderModel[]> = {
       "kind": "tts"
     },
     {
+      "id": "gemini-3.8-flash-tts",
+      "name": "Gemini 3.8 Flash TTS",
+      "kind": "tts"
+    },
+    {
+      "id": "gemini-3.8-flash-lite-tts",
+      "name": "Gemini 3.8 Flash Lite TTS",
+      "kind": "tts"
+    },
+    {
       "id": "embedding-001",
       "name": "Embedding 001",
       "dimensions": 768,
@@ -2486,6 +2495,16 @@ export const BUILTIN_MODELS_BY_PROVIDER: Record<string, ProviderModel[]> = {
     {
       "id": "glm-4.5-air",
       "name": "GLM-4.5-Air"
+    }
+  ],
+  "zcode": [
+    {
+      "id": "glm-5.3",
+      "name": "GLM 5.3"
+    },
+    {
+      "id": "glm-5.3-flash",
+      "name": "GLM 5.3 Flash"
     }
   ],
   "glm": [

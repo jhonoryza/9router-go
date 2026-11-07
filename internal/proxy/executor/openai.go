@@ -11,7 +11,9 @@ import (
 
 	"9router/proxy/internal/constants"
 	"9router/proxy/internal/guardrails"
+	"9router/proxy/internal/jsonfence"
 	"9router/proxy/internal/log"
+	"9router/proxy/internal/providers"
 	"9router/proxy/internal/proxy"
 	"9router/proxy/internal/shutdown"
 	"9router/proxy/internal/translator"
@@ -107,6 +109,62 @@ func renameMaxTokensBody(body []byte) []byte {
 	return out
 }
 
+// volcengineArkGLM5OutputCeiling is Volcengine Ark's output-token ceiling for
+// GLM-5 models. Ark answers HTTP 400 for a GLM-5 request that asks for more
+// than this, so a client budget above it is folded down before dispatch.
+const volcengineArkGLM5OutputCeiling = 4096
+
+// clampVolcengineArkGLM5OutputTokens folds a GLM-5 output budget above the
+// Ark ceiling down to the model's capability ceiling (capped at Ark's 4096).
+// A budget at or below the ceiling, a request that sets no budget, and every
+// non-GLM-5 model are left byte-identical. All three output-budget spellings
+// are clamped: max_tokens, max_completion_tokens and max_output_tokens.
+func clampVolcengineArkGLM5OutputTokens(provider string, body []byte) []byte {
+	var m map[string]any
+	if err := json.Unmarshal(body, &m); err != nil {
+		return body
+	}
+	model, _ := m["model"].(string)
+	if !isVolcengineArkGLM5Model(model) {
+		return body
+	}
+	// Ark's GLM-5 output ceiling, further bounded by the model's declared
+	// maxOutput from the capability registry when one is specified.
+	maxOutputCap := volcengineArkGLM5OutputCeiling
+	if maxOutput := providers.GetCapabilitiesForModel(provider, model).MaxOutput; maxOutput > 0 && maxOutput < maxOutputCap {
+		maxOutputCap = maxOutput
+	}
+	changed := false
+	for _, field := range []string{"max_tokens", "max_completion_tokens", "max_output_tokens"} {
+		v, ok := m[field]
+		if !ok {
+			continue
+		}
+		n, ok := outputBudgetOf(v)
+		if !ok || n <= int64(maxOutputCap) {
+			continue
+		}
+		m[field] = maxOutputCap
+		changed = true
+	}
+	if !changed {
+		return body
+	}
+	out, err := marshalStable(m)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+// isVolcengineArkGLM5Model reports whether a model id is a GLM-5 model whose
+// output is capped at the Ark ceiling: any model id containing 'glm-5'
+// (case-insensitive), e.g. bare glm-5*, GLM-5.1, glm-5-turbo,
+// zai-org/GLM-5.2, or a Doubao-family id carrying the glm-5 qualifier.
+func isVolcengineArkGLM5Model(model string) bool {
+	return strings.Contains(strings.ToLower(model), "glm-5")
+}
+
 // DowngradeJsonSchemaToJSONObject downgrades response_format from "json_schema"
 // to {"type":"json_object"} for providers like DeepSeek or openai-compatible nodes
 // that do not support OpenAI Structured Outputs (upstream decolua/9router PR #5304).
@@ -146,6 +204,13 @@ func ForwardOpenAI(w http.ResponseWriter, req *Request) error {
 	}
 	if req.Provider == "deepseek" {
 		req.Body = DowngradeJsonSchemaToJSONObject(req.Body)
+	}
+	if req.Provider == "volcengine-ark" {
+		// Volcengine Ark answers HTTP 400 when a GLM-5 model is asked for more
+		// than its output-token ceiling, so a client budget above it is folded
+		// down before the request leaves the upstream. The ceiling is the model's
+		// declared maxOutput from the capability registry, capped at Ark's 4096.
+		req.Body = clampVolcengineArkGLM5OutputTokens(req.Provider, req.Body)
 	}
 	resp, err := proxy.ForwardOpenAI(req.Ctx, req.Client, req.Config, req.APIKey, req.Body, req.IsStream)
 	if err != nil {
@@ -193,7 +258,7 @@ func ForwardOpenAI(w http.ResponseWriter, req *Request) error {
 				return jsonResponse(req.Ctx, w, bytes.NewReader(append(head, rest...)), req.TranslateResp, req.ResponseBuf)
 			}
 		}
-		stallReader := proxy.NewStallReaderWithContext(req.Ctx, streamBody, 0, "openai")
+		stallReader := proxy.NewStallReaderWithContext(req.Ctx, streamBody, req.Config.ResolveStallTimeout(proxy.ResolveDefaultStallTimeout()), "openai")
 		bodyCloser = stallReader
 		if req.UpstreamClaude {
 			// Upstream is Claude Messages, client is OpenAI (/v1/chat/completions):
@@ -350,6 +415,10 @@ func sseStream(o sseStreamOpts) error {
 		if liftAliases {
 			patchers = append(patchers, liftReasoningAliasesPayload)
 		}
+		// One stateful decoder per stream: visible Composer text can span chunks and
+		// the  closing tag can be split across chunk boundaries.
+		composerDecoder := &composerThinkingDecoder{}
+		patchers = append(patchers, composerDecoder.Process)
 		return proxy.SSECopy(hw, upstream, flusher, func(chunk []byte) {
 			if ttft != nil && *ttft == 0 {
 				*ttft = time.Since(startTime).Milliseconds()
@@ -486,6 +555,13 @@ func jsonResponse(ctx context.Context, w http.ResponseWriter, upstream io.Reader
 		return guardrailBlockFailure(gerr)
 	}
 	body = filtered
+	// A model asked for machine-readable JSON may still answer with a ```json
+	// fence. Unwrap it here — after the guardrail has seen the model's own
+	// words, before either write path hands bytes to the client — so the
+	// unwrapped body is what the log buffer and both the OpenAI and Claude
+	// write paths send. Only a body whose contents parse as JSON is unwrapped,
+	// and only for a request that asked for JSON.
+	body = jsonfence.ApplyContents(ctx, body)
 
 	if buf != nil {
 		buf.Write(body)

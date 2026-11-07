@@ -18,12 +18,12 @@ import (
 // so each case starts from a cold, production-shaped state.
 func resetLiveCatalog(t *testing.T) {
 	t.Helper()
-	prevKiro, prevGrok := kiroCatalogBaseURL, grokCLICatalogURL
+	prevKiro, prevGrok, prevAnthro := kiroCatalogBaseURL, grokCLICatalogURL, anthropicCatalogURL
 	liveCatalogStore.mu.Lock()
 	liveCatalogStore.entries = make(map[string]liveCatalogEntry)
 	liveCatalogStore.mu.Unlock()
 	t.Cleanup(func() {
-		kiroCatalogBaseURL, grokCLICatalogURL = prevKiro, prevGrok
+		kiroCatalogBaseURL, grokCLICatalogURL, anthropicCatalogURL = prevKiro, prevGrok, prevAnthro
 		liveCatalogStore.mu.Lock()
 		liveCatalogStore.entries = make(map[string]liveCatalogEntry)
 		liveCatalogStore.mu.Unlock()
@@ -214,6 +214,10 @@ func TestRefreshLiveCatalogs_GrokCLI(t *testing.T) {
 	}
 }
 
+// DIVERGENCE (fork): upstream's TestHandleModels_AnthropicLiveCatalog and
+// TestHandleModels_AnthropicLiveCatalogFallsBackToStatic assert the
+// fetch-in-request-path design; this fork is cache-only (see live_catalog.go),
+// so those tests are skipped. The two fork-side refresh tests below are kept.
 // Providers without a live resolver are skipped, not counted as failures.
 func TestRefreshLiveCatalogs_SkipsProvidersWithoutResolver(t *testing.T) {
 	resetLiveCatalog(t)
