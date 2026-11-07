@@ -63,22 +63,7 @@ git push origin main                  # CI docker-publish jalan otomatis
 
 Konflik yang hampir selalu muncul: `internal/handlers/chat/live_catalog.go`, `internal/handlers/chat/live_catalog_handler_test.go`, `internal/handlers/dashboard/routes.go`, `internal/handlers/router.go`, `internal/proxy/opencode.go`, `internal/proxy/executor/transform.go` (reasoning-inject scope fork #4805 vs upstream #5290 → pertahankan logika fork: provider rule wins + catalog-driven placeholder).
 
-CI hijau → deploy (lihat bawah) → cek banner versi via `docker logs 9router-go | head -2` dan `/health`.
-
----
-
-## Deployment (VPS pribadi)
-
-- Host: VPS pribadi (detail host tidak dicatat di repo publik — lihat catatan operator / memory agent)
-- Container `9router-go`: image `jhonoryza/9router-go:latest`, ports `20128:20130` + `20129:20130`, env `ALLOW_PRIVATE_NETWORKING=true` (warp egress & opencode-free-bridge via docker bridge IP host), volume `infra_9router_data:/root/.9router`, **network `netssd2`** (network traefik - WAJIB; network lain = traefik 504), restart unless-stopped.
-- **Jalur publik:** `ai.labkita.my.id` → Cloudflare proxied A record ke IP public VPS → port 80 traefik → label `Host('ai.labkita.my.id')` → container port 20130. Setelah re-create container selalu verify: `curl -H 'Host: ai.labkita.my.id' http://localhost/` di host, lalu `curl https://ai.labkita.my.id/health`.
-- Deploy:
-  ```bash
-  ssh <host> "docker pull jhonoryza/9router-go:latest && docker stop 9router-go && docker rm 9router-go && docker run -d --name 9router-go -p 20128:20130 -p 20129:20130 -e ALLOW_PRIVATE_NETWORKING=true -v infra_9router_data:/root/.9router --restart unless-stopped --network netssd2 -l 'traefik.enable=true' -l 'traefik.http.routers.ai9router.entrypoints=web' -l 'traefik.http.routers.ai9router.rule=Host(\`ai.labkita.my.id\`)' -l 'traefik.http.services.ai9router.loadbalancer.server.port=20130' jhonoryza/9router-go:latest && sleep 5 && curl -s http://127.0.0.1:20128/health && docker image prune -f"
-  ```
-- Dashboard & API keys: kredensial tidak dicatat di repo publik (lihat catatan operator / memory agent).
-- **zcode provider (#861, v1.9.16-exp.5):** koneksi via device-flow login baru per akun (dashboard → ZCode). TIDAK bisa dipindah dari koneksi `glm` yang ada - endpoint & kredensial beda (glm = coding-plan API key berbayar; zcode = plan JWT Start/Weekend gratisan).
-- Provider tambahan fork: `ocb/` opencode-free-bridge (custom node `openai-compatible-chat-82e07aa5-396a-4d67-b459-cef0f844d720`, systemd user service port 20140 di host). Combo `buff` (fallback): `cbai/deepseek-v4.1-flash` → `ocb/beam-free` → `oc/beam-free` → `ocz/beam-free`.
+CI hijau → deploy (prosedur deploy ada di catatan operator, tidak dicatat di repo publik) → cek banner versi via `docker logs 9router-go | head -2` dan `/health`.
 
 ---
 
