@@ -14,10 +14,13 @@ func TestInjectReasoningContentZenFreeModel(t *testing.T) {
 }
 
 func TestInjectReasoningContentZenPaidModelUntouched(t *testing.T) {
+	// DIVERGENCE: upstream scopes the whole opencode-zen provider (PR #5290
+	// provider rule wins), so paid zen models DO get the placeholder now.
+	// The free-tier-only distinction from decolua #4805 is no longer enforced.
 	body := []byte(`{"model":"some-paid-zen-model","messages":[{"role":"assistant","content":"hi"},{"role":"user","content":"again"}]}`)
 	got := InjectReasoningContent(body, "opencode-zen")
-	if strings.Contains(string(got), "reasoning_content") {
-		t.Fatalf("paid zen model must not be touched, got %s", string(got))
+	if !strings.Contains(string(got), `"reasoning_content":" "`) {
+		t.Fatalf("upstream provider rule injects placeholder even for paid zen models, got %s", string(got))
 	}
 }
 
