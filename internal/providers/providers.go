@@ -142,7 +142,11 @@ func BedrockModelFamily(providerID, model string) (ok bool, hint string) {
 }
 
 // IsGeminiNative returns true if provider uses Gemini-native format.
-func (p *ProviderConfig) IsGeminiNative() bool { return p.Format == "gemini-native" }
+func (p *ProviderConfig) IsGeminiNative() bool {
+	// Cloud Code Assist speaks the same Gemini envelope with a different
+	// wrapper, so it routes through the same native handler.
+	return p.Format == "gemini-native" || p.Format == "gemini-cli"
+}
 
 // IsGeminiOpenAICompat returns true if provider is Gemini behind an
 // OpenAI-compatible endpoint whose tool schema validation is as strict as the
@@ -190,6 +194,10 @@ func WithoutStaticHeader(cfg *ProviderConfig, name string) *ProviderConfig {
 // It is the same set upstream wires into PROVIDER_MODELS_CONFIG
 // (src/app/api/providers/[id]/models/route.js, v0.5.91).
 var modelsListURL = map[string]string{
+	// free-pi publishes its catalog at /client-version rather than the standard
+	// /v1/models shape. The suggested-models handler has a "free-pi" filter that
+	// reads the `models` array from this response.
+	"free-pi":     "https://api.freepi.ai/client-version",
 	"tokenharbor": "https://tokenharbor.ai/v1/models",
 	"dahl":        "https://inference.dahl.global/v1/models",
 	"atria":       "https://api.atria-asi.ai/v1/models",
@@ -686,7 +694,7 @@ var KnownProviders = map[string]ProviderConfig{
 		AuthScheme: "bearer",
 	},
 	"opencode-go": {
-		BaseURL:    "https://opencode.ai/zen/go/v1/chat/completions",
+		BaseURL:    "https://opencode.ai/inference/go/openai/v1/chat/completions",
 		AuthHeader: "Authorization",
 		AuthScheme: "bearer",
 	},
@@ -1318,9 +1326,15 @@ var KnownProviders = map[string]ProviderConfig{
 		AuthScheme: "bearer",
 	},
 	"gemini-cli": {
-		BaseURL:    "https://daily-cloudcode-pa.googleapis.com/v1internal",
+		// Cloud Code Assist speaks the Gemini envelope: the body is
+		// {project, model, request} and the path is :generateContent on the
+		// v1internal root. Without the format marker a request fell through to
+		// ForwardOpenAI and POSTed an OpenAI body at cloudcode-pa, which that
+		// endpoint cannot answer.
+		BaseURL:    "https://cloudcode-pa.googleapis.com/v1internal",
 		AuthHeader: "Authorization",
 		AuthScheme: "bearer",
+		Format:     "gemini-cli",
 	},
 	"google-pse": {
 		BaseURL:      "https://www.googleapis.com/customsearch/v1",
@@ -1450,6 +1464,24 @@ var KnownProviders = map[string]ProviderConfig{
 			"content-type": "application/json",
 		},
 	},
+	// Free-pi — the free, ad-funded distribution of the `pi` coding agent
+	// (dennisonbertram/free-pi-cli). Its upstream is plain [OI] Chat
+	// Completions behind a Bearer JWT, so the transport looks ordinary; what
+	// is not ordinary is session identity. Every request must carry a stable
+	// `x-session-id`, and the account tolerates only a handful of concurrent
+	// sessions (hungkevin/free-pi-cli-proxy server.mjs:958 pins the cap at 4;
+	// we deliberately occupy one — see internal/proxy/executor/free_pi.go).
+	//
+	// Neither header can live in StaticHeaders: x-session-id is derived per
+	// account and x-client-version is refreshed from GET /client-version, so
+	// both are applied by the executor rather than the shared passthrough.
+	// The auth pair is the ordinary bearer one, which is what makes the JWT a
+	// drop-in credential for the existing connection store.
+	"free-pi": {
+		BaseURL:    "https://api.freepi.ai/v1/chat/completions",
+		AuthHeader: "Authorization",
+		AuthScheme: "bearer",
+	},
 	"atmorouter": {
 		BaseURL:    "https://atmorouter.dev/v1/chat/completions",
 		AuthHeader: "Authorization",
@@ -1478,6 +1510,19 @@ var RetryableStatusCodes = map[int]bool{
 func PreservesCacheControl(provider string) bool {
 	if cfg, ok := KnownProviders[provider]; ok {
 		return cfg.PreserveCacheControl
+	}
+	return false
+}
+
+// StrictReasoningRemoving reports whether a provider rejects unknown
+// assistant-message reasoning fields echoed on history (upstream
+// paramSupport dropMessageFields): groq, mistral, and cerebras answer 400
+// or 422 on reasoning_content/reasoning/reasoning_details replayed by
+// reasoning clients (e.g. Hermes).
+func StrictReasoningRemoving(provider string) bool {
+	switch provider {
+	case "groq", "mistral", "cerebras":
+		return true
 	}
 	return false
 }

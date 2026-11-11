@@ -47,6 +47,7 @@ func SetupRoutes(r interface {
 	Put(pattern string, handlerFn http.HandlerFunc)
 	Patch(pattern string, handlerFn http.HandlerFunc)
 	Delete(pattern string, handlerFn http.HandlerFunc)
+	Options(pattern string, handlerFn http.HandlerFunc)
 	HandleFunc(pattern string, handlerFn http.HandlerFunc)
 }, repo *db.Repo, ts *TokenSaverConfig) *chat.ChatHandler {
 	chatH := chat.NewChatHandler(repo, ts)
@@ -98,6 +99,11 @@ func SetupRoutes(r interface {
 	r.Get("/models/{kind}", chatH.HandleModelsByKind)
 	r.Get("/models/*", chatH.HandleModelLookup)
 	r.Get("/v1/models", chatH.HandleModels)
+	// Gemini API surface. A Gemini SDK speaks only this protocol — it lists
+	// models, then posts contents[] to an action-suffixed path — so without
+	// these routes a Gemini client cannot use the gateway at all.
+	r.Get("/v1beta/models", chatH.HandleGeminiListModels)
+	r.Post("/v1beta/models/*", chatH.HandleGeminiGenerateContent)
 	r.Get("/v1/models/*", chatH.HandleModelLookup)
 	r.Get("/api/v1/models", chatH.HandleModels)
 	r.Get("/api/v1/models/*", chatH.HandleModelLookup)
@@ -110,6 +116,13 @@ func SetupRoutes(r interface {
 	r.Post("/messages", chatH.HandleMessages)
 	r.Post("/messages/count_tokens", chatH.HandleCountTokens)
 	r.Post("/api/chat", chatH.HandleOllamaChat)
+	// An Ollama client lists models before it chats; without this the gateway
+	// looks like an Ollama server with nothing installed. The preflight for
+	// these two paths is registered in SetupServerRouter, outside the API-key
+	// group: a browser never sends credentials on an OPTIONS request, so a
+	// preflight answered by this group 401s and the real GET never happens.
+	r.Get("/api/tags", mediaH.HandleOllamaTags)
+	r.Get("/tags", mediaH.HandleOllamaTags)
 
 	// Media, Audio, Video & Web Tools Domain
 	r.Post("/embeddings", mediaH.HandleEmbeddings)
@@ -166,6 +179,7 @@ func SetupRoutes(r interface {
 	r.Delete("/headroom/extras", headroomH.HandleHeadroomExtras)
 	r.HandleFunc("/headroom/proxy", headroomH.HandleHeadroomProxy)
 	r.HandleFunc("/headroom/proxy/*", headroomH.HandleHeadroomProxy)
+	r.Post("/mcp", headroomH.HandleMCP)
 
 	r.Post("/api/headroom/start", headroomH.HandleHeadroomStart)
 	r.Post("/api/headroom/stop", headroomH.HandleHeadroomStop)
@@ -201,6 +215,13 @@ func SetupRoutes(r interface {
 	// GLM Reset Cards (Z.ai international)
 	r.Get("/api/usage/{connectionId}/glm-reset-cards", dashH.HandleGetGLMResetCards)
 	r.Post("/api/usage/{connectionId}/glm-reset-cards", dashH.HandleRedeemGLMResetCard)
+
+	// Free-pi ad surface. The creative is served to the dashboard, and the
+	// impression is reported only from the client's render event — an
+	// impression for an ad nobody saw is a false report to the advertiser whose
+	// spend funds the inference (see free_pi_ads.go).
+	r.Get("/api/free-pi/ad", dashH.HandleGetFreePiAd)
+	r.Post("/api/free-pi/ad/impression", dashH.HandleFreePiImpression)
 
 	// Debug Tracing Domain (p50/p95 latency per provider+model)
 	r.Get("/debug/traces", HandleDebugTraces)
@@ -276,6 +297,13 @@ func SetupDashboardRoutes(r chi.Router, repo *db.Repo, chatH *chat.ChatHandler) 
 	// GLM Reset Cards (Z.ai international)
 	r.Get("/api/usage/{connectionId}/glm-reset-cards", dashH.HandleGetGLMResetCards)
 	r.Post("/api/usage/{connectionId}/glm-reset-cards", dashH.HandleRedeemGLMResetCard)
+
+	// Free-pi ad surface. The creative is served to the dashboard, and the
+	// impression is reported only from the client's render event — an
+	// impression for an ad nobody saw is a false report to the advertiser whose
+	// spend funds the inference (see free_pi_ads.go).
+	r.Get("/api/free-pi/ad", dashH.HandleGetFreePiAd)
+	r.Post("/api/free-pi/ad/impression", dashH.HandleFreePiImpression)
 
 	// Cache Analytics & Management
 	r.Get("/api/cache", dashH.HandleGetCache)
@@ -370,6 +398,7 @@ func SetupDashboardRoutes(r chi.Router, repo *db.Repo, chatH *chat.ChatHandler) 
 	r.Post("/api/keys/{id}/reset-quota", dashH.HandleResetApiKeyQuota)
 	r.Get("/api/keys/{id}/models", dashH.HandleGetApiKeyModels)
 	r.Put("/api/keys/{id}/models", dashH.HandleSetApiKeyModels)
+	r.Get("/api/keys/{id}/budget", dashH.HandleGetApiKeyBudget)
 	r.Put("/api/keys/{id}", dashH.HandleUpdateApiKey)
 	r.Get("/api/plans", dashH.HandleListPlans)
 	r.Post("/api/plans", dashH.HandleCreatePlan)
@@ -458,10 +487,11 @@ func SetupDashboardRoutes(r chi.Router, repo *db.Repo, chatH *chat.ChatHandler) 
 	r.Post("/api/tunnel/tailscale-enable", dashH.HandleTailscaleEnable)
 	r.Post("/api/tunnel/tailscale-disable", dashH.HandleTailscaleDisable)
 
-	// Single Sign-On settings checks + SP metadata (profile page)
+	// Single Sign-On settings checks (profile page). The browser login flows and
+	// SP metadata are registered in SetupServerRouter instead: they have to be
+	// reachable before a session exists.
 	r.Post("/api/auth/oidc/test", ssoH.HandleOidcTest)
 	r.Post("/api/auth/saml/test", ssoH.HandleSamlTest)
-	r.Get("/api/auth/saml/metadata", ssoH.HandleSamlMetadata)
 
 	// Mount OAuth routes under dashboard auth so web dashboard can initiate and exchange tokens
 	oauthH := oauth.NewOAuthHandler(repo)
@@ -502,6 +532,16 @@ func mountOAuthRoutes(r interface {
 	r.Post("/api/oauth/freebuff/poll", oauthH.HandleFreebuffPoll)
 	r.Get("/api/oauth/freebuff/session", oauthH.HandleFreebuffSessionStatus)
 	r.Post("/api/oauth/freebuff/session/switch", oauthH.HandleFreebuffSessionSwitch)
+	// free-pi: GitHub device flow. initiate() refuses to call upstream unless the
+	// request asserts the user accepted the consent screen, and the consent text
+	// itself is served from here rather than duplicated in the SPA.
+	r.Get("/api/oauth/free-pi/consent", oauthH.HandleFreePiConsent)
+	r.Post("/api/oauth/free-pi/initiate", oauthH.HandleFreePiInitiate)
+	r.Post("/api/oauth/free-pi/poll", oauthH.HandleFreePiPoll)
+	// The dashboard equivalent of free-pi-cli's /close-other-session: a
+	// deliberate user action, because the same call would also end a human's
+	// running CLI session on that account.
+	r.Post("/api/oauth/free-pi/session/reset", oauthH.HandleFreePiSessionReset)
 	r.Get("/api/oauth/antigravity/authorize", oauthH.HandleAntigravityAuthorize)
 	r.Post("/api/oauth/antigravity/exchange", oauthH.HandleAntigravityExchange)
 	r.Get("/api/oauth/cline/authorize", oauthH.HandleClineAuthorize)
@@ -545,10 +585,33 @@ func mountOAuthRoutes(r interface {
 // warning on SetupRoutes about the two PersistentStores.
 func SetupServerRouter(r chi.Router, repo *db.Repo, ts *TokenSaverConfig) *chat.ChatHandler {
 	// Public (unauthenticated) endpoints
-	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
+	healthH := func(w http.ResponseWriter, r *http.Request) {
+		// The browser probes this endpoint from the dashboard's tunnel and
+		// Tailscale cards (EndpointView.svelte clientPingUrl). A cross-origin
+		// fetch needs CORS on the response or the probe fails on a healthy
+		// gateway, so the headers are part of the contract, not decoration.
+		handlerutil.WriteCORSHeaders(w)
 		w.Header().Set(constants.HeaderContentType, constants.ContentTypeJSON)
 		w.Write([]byte(`{"status":"ok"}`))
-	})
+	}
+	r.Get("/health", healthH)
+	// Upstream serves the same answer under /api as well, and an older
+	// dashboard build polls that path.
+	r.Get("/api/health", healthH)
+	// Preflights live here, not in the API-key group: an OPTIONS request never
+	// carries credentials, so answering it behind RequireApiKey would 401 and
+	// the browser would never send the real request. Registered per path rather
+	// than as a blanket OPTIONS passthrough in the middleware, which would have
+	// opened every protected route.
+	corsPreflight := func(w http.ResponseWriter, r *http.Request) {
+		handlerutil.WriteCORSPreflight(w)
+	}
+	r.Options("/health", corsPreflight)
+	r.Options("/api/health", corsPreflight)
+	// An Ollama client lists models before it chats, and a browser-based one
+	// sends a preflight first.
+	r.Options("/api/tags", corsPreflight)
+	r.Options("/tags", corsPreflight)
 	// Version info is public (upstream PUBLIC_API_PATHS): the Sidebar polls
 	// /api/version on every dashboard page including /login, before any
 	// session or API key exists.
@@ -632,6 +695,22 @@ func SetupServerRouter(r chi.Router, repo *db.Repo, ts *TokenSaverConfig) *chat.
 	r.Get("/api/auth/status", dashH.HandleAuthStatus)
 	r.Post("/api/auth/login", dashH.HandleAuthLogin)
 	r.Post("/api/auth/logout", dashH.HandleAuthLogout)
+	// Deliberately outside the admin group: this is the recovery path for an
+	// operator who cannot log in, so it cannot require the session it is meant
+	// to restore. The handler refuses anything but a loopback peer on the TCP
+	// connection, and rejects cross-site POSTs.
+	r.Post("/api/auth/reset-password", dashH.HandleResetPassword)
+	// SSO browser login flows and SP metadata. Anonymous by necessity: they
+	// exist precisely for the case where no session exists yet, so mounting
+	// them behind RequireDashboardAuth 401'd the browser at the one moment they
+	// are needed. The settings *tests* stay in the dashboard group, because
+	// those are admin reads that echo the IdP configuration.
+	ssoPubH := sso.NewHandler(repo)
+	r.Get("/api/auth/oidc/start", ssoPubH.HandleOIDCStart)
+	r.Get("/api/auth/oidc/callback", ssoPubH.HandleOIDCCallback)
+	r.Get("/api/auth/saml/start", ssoPubH.HandleSAMLStart)
+	r.Post("/api/auth/saml/acs", ssoPubH.HandleSAMLACS)
+	r.Get("/api/auth/saml/metadata", ssoPubH.HandleSamlMetadata)
 	r.Get("/api/settings/require-login", dashH.HandleRequireLogin)
 	r.Get("/api/tunnel/status", dashH.HandleTunnelStatus)
 
@@ -746,7 +825,21 @@ func SetupServerRouter(r chi.Router, repo *db.Repo, ts *TokenSaverConfig) *chat.
 	// before any traffic, so the cache on that instance never fills.
 	r.Group(func(r chi.Router) {
 		r.Use(middleware.RequireDashboardAuth(repo))
+		// The audit trail records every mutating dashboard request (plus the
+		// sensitive reads it names) and serves the log itself. It reads the
+		// recorder from the repo per request — the recorder starts in the boot
+		// hook, after this router exists, so a nil recorder simply means
+		// "auditing off" for a router built by hand in a unit test.
+		r.Use(dashboard.AuditMiddleware(repo))
 		SetupDashboardRoutes(r, repo, engineChatH)
+		// The log itself: list, export, verify the chain, and the recorder
+		// counters. Mounted in this group (not inside SetupDashboardRoutes) so
+		// the endpoints are present in a production boot even though the tests
+		// table RegisterRoutes mounts does not know them.
+		r.Get("/api/audit", dashH.HandleAuditList)
+		r.Get("/api/audit/export", dashH.HandleAuditExport)
+		r.Get("/api/audit/verify", dashH.HandleAuditVerify)
+		r.Get("/api/audit/status", dashH.HandleAuditStatus)
 	})
 
 	// CLI Tools status is a dashboard read: the SPA calls it with the session

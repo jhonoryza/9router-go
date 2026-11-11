@@ -22,6 +22,12 @@ type comboStickyState struct {
 	// requests reuse it so a tool-use sequence stays on the same provider,
 	// even after Index has advanced for the next turn.
 	ServingIndex int
+
+	// Weighted round-robin state
+	Sig            string
+	CurrentWeights map[string]int
+	LastSeat       string
+	ServingRotated []string
 }
 
 // smartStickyEntry is one session's pinned model in the smart strategy.
@@ -59,6 +65,10 @@ type ChatHandler struct {
 	// one would otherwise upsert the same row.
 	deprecationMu    sync.Mutex
 	deprecationCache map[string]time.Time
+	// cooldownCache throttles kv writes when a model is cooled down after a
+	// live failure, so repeated failures within a single request window do not
+	// hammer the kv table with identical cooldown upserts.
+	cooldownCache map[string]time.Time
 	// smartSticky pins the model a session's smart-routed combo settles on,
 	// so later turns reuse the provider holding the warm prompt cache.
 	smartStickyMu sync.Mutex

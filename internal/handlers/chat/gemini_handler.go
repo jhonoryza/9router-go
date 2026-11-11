@@ -122,7 +122,24 @@ func (h *ChatHandler) forwardGeminiNativeRequest(
 		return h.forwardRequest(ctx, w, cfg, apiKey, body, isStream, translateResponse, metrics, httpClient, provider, false, false)
 	}
 
+	// Fallback session to connectionID when caller provides no session header
+	if handlerutil.GetSessionID(ctx) == "" && connectionID != "" {
+		ctx = handlerutil.WithSessionID(ctx, connectionID)
+	}
+
 	upstreamStarted := time.Now()
+
+	// Per-connection admission: concurrency bound, backoff, circuit breaker.
+	// A 403 TOS_VIOLATION bypasses both backoff and breaker (#996 regression
+	// pin) — RecordFailure returns early for it.
+	release, admErr := admitAntigravity(ctx, connectionID)
+	if admErr != nil {
+		return admErr
+	}
+	if release != nil {
+		defer release()
+	}
+
 	resp, err := proxy.ForwardGemini(ctx, httpClient, cfg, apiKey, string(body), isStream, projectID, modelName)
 	// The one number that separates "the model was thinking" from "the
 	// gateway was slow": everything this handler does before dialing is
@@ -132,6 +149,7 @@ func (h *ChatHandler) forwardGeminiNativeRequest(
 		"ms", time.Since(upstreamStarted).Milliseconds(), "provider", provider, "model", modelName)
 	if err != nil {
 		if uErr, ok := err.(*proxy.UpstreamError); ok {
+			recordAntigravityOutcome(connectionID, uErr.StatusCode, uErr.Body)
 			if uErr.StatusCode == http.StatusConflict || uErr.StatusCode == http.StatusTooManyRequests {
 				if dur, ok := extractResetDuration(uErr.Body); ok {
 					BlockAntigravityModelUntil(connectionID, modelName, time.Now().UTC().Add(dur))
@@ -145,6 +163,7 @@ func (h *ChatHandler) forwardGeminiNativeRequest(
 		}
 		return fmt.Errorf("ForwardGemini (%s/%s): %w", provider, modelName, err)
 	}
+	recordAntigravityOutcome(connectionID, resp.StatusCode, nil)
 
 	var bodyCloser io.Closer = resp.Body
 	defer func() {
@@ -424,6 +443,7 @@ func (h *ChatHandler) refreshOAuthLocked(connectionID, currentToken string) (oau
 	}
 	log.Info("oauth", "token refreshed", "provider", provider, "project", newPID)
 	h.clearOAuthAccountPark(connectionID)
+	closeAntigravityState(connectionID)
 	return oauthTokenResult{token: refreshResult.AccessToken, projectID: newPID}, nil
 }
 

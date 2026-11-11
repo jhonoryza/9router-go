@@ -93,7 +93,23 @@ func RegisterAll() {
 	Register("bazaarlink", func() Executor { return ForwardOpenAI })
 	Register("bluesminds", func() Executor { return ForwardOpenAI })
 	Register("devin-cli", func() Executor { return ForwardOpenAI })
+	// Vertex AI: the registry entries carried no executor, so every request
+	// POSTed an OpenAI body at aiplatform.googleapis.com, which serves neither
+	// lane. Both provider ids share one implementation — the difference is the
+	// URL shape, decided inside from the provider id.
+	Register("vertex", func() Executor { return ForwardVertex })
+	Register("vertex-partner", func() Executor { return ForwardVertex })
+	// Perplexity Web is not OpenAI-compatible in either direction: the request
+	// is a query_str envelope and the answer is Perplexity's own event stream,
+	// so the passthrough cannot serve it.
+	Register("perplexity-web", func() Executor { return ForwardPerplexityWeb })
 	Register("freebuff", func() Executor { return ForwardFreebuff })
+	// free-pi cannot ride the shared passthrough: it must set two per-account
+	// headers (x-session-id, x-client-version) that the registry's static map
+	// cannot carry, and it must inspect the upstream status so a 409
+	// concurrent_session stays a 409 instead of being written out as a 200
+	// carrying an error body.
+	Register("free-pi", func() Executor { return ForwardFreePi })
 	Register("kilo-gateway", func() Executor { return ForwardOpenAI })
 	Register("llm7", func() Executor { return ForwardOpenAI })
 	Register("morph", func() Executor { return ForwardOpenAI })

@@ -264,7 +264,6 @@ func buildResponsesBody(body []byte) ([]byte, string, error) {
 				}
 			}
 
-			applyCodexModelShape(m, cleanModel)
 			out, err := marshalStable(m)
 			return out, cleanModel, err
 		}
@@ -282,6 +281,8 @@ func buildResponsesBody(body []byte) ([]byte, string, error) {
 		ReasoningEffort     string         `json:"reasoning_effort,omitempty"`
 		Reasoning           any            `json:"reasoning,omitempty"`
 		Tools               jsontext.Value `json:"tools,omitempty"`
+		ToolChoice          jsontext.Value `json:"tool_choice,omitempty"`
+		ParallelToolCalls   *bool          `json:"parallel_tool_calls,omitempty"`
 		ResponseFormat      jsontext.Value `json:"response_format,omitempty"`
 		// ServiceTier is carried through unchanged. Upstream does the same in
 		// open-sse/translator/request/openai-responses.js, and the Chat
@@ -382,11 +383,15 @@ func buildResponsesBody(body []byte) ([]byte, string, error) {
 					cid = fmt.Sprintf("call_%d_%d", toolSeq, tcIdx)
 				}
 				pendingToolCallIDs = append(pendingToolCallIDs, cid)
+				args := tc.Function.Arguments
+				if name == "Agent" {
+					args = stripAgentIsolationFromArgs(args)
+				}
 				inputItems = append(inputItems, map[string]any{
 					"type":      "function_call",
 					"call_id":   clampCallID(cid),
 					"name":      name,
-					"arguments": tc.Function.Arguments,
+					"arguments": args,
 				})
 			}
 			toolSeq++
@@ -524,6 +529,16 @@ func buildResponsesBody(body []byte) ([]byte, string, error) {
 						}
 					}
 				}
+				if toolName, _ := tool["name"].(string); toolName == "Agent" {
+					if pMap, ok := tool["parameters"].(map[string]any); ok {
+						if props, ok := pMap["properties"].(map[string]any); ok {
+							delete(props, "isolation")
+						}
+					}
+				}
+				// Chat tools are non-strict by default; Responses may normalize
+				// omitted strict and make optional parameters mandatory.
+				tool["strict"] = false
 				if strict != nil {
 					tool["strict"] = *strict
 				}
@@ -534,7 +549,16 @@ func buildResponsesBody(body []byte) ([]byte, string, error) {
 			}
 		}
 	}
-
+	// tool_choice must reach translateCodexClaudeWebSearchChoice before the
+	// model-shape rewrite, so it is decoded and carried over here rather than
+	// after. A jsontext.Value is preserved raw so an unknown or non-map value
+	// still passes through unchanged.
+	if oreq.ToolChoice.Kind() != jsontext.KindInvalid {
+		var tc any
+		if json.Unmarshal(oreq.ToolChoice, &tc) == nil {
+			respReq["tool_choice"] = tc
+		}
+	}
 	// Presence matters more than the value here: a client that sent null, "", a
 	// number or "fast" gets that byte for byte, because the destination decides
 	// what it means. Only a field the client never sent is dropped —
@@ -550,7 +574,9 @@ func buildResponsesBody(body []byte) ([]byte, string, error) {
 		}
 	}
 
-	applyCodexModelShape(respReq, cleanModel)
+	if oreq.ParallelToolCalls != nil {
+		respReq["parallel_tool_calls"] = *oreq.ParallelToolCalls
+	}
 	reqBody, err := marshalStable(respReq)
 	return reqBody, cleanModel, err
 }
@@ -1021,4 +1047,26 @@ func InjectReasoningContent(body []byte, provider string) []byte {
 		return body
 	}
 	return newBody
+}
+
+// stripAgentIsolationFromArgs removes "isolation" from the JSON arguments of an Agent tool call
+// in conversation history, breaking in-context repetition loops where a model mimics prior
+// worktree probe calls.
+func stripAgentIsolationFromArgs(raw string) string {
+	if !strings.Contains(raw, "isolation") {
+		return raw
+	}
+	var m map[string]any
+	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+		return raw
+	}
+	if _, has := m["isolation"]; !has {
+		return raw
+	}
+	delete(m, "isolation")
+	out, err := json.Marshal(m)
+	if err != nil {
+		return raw
+	}
+	return string(out)
 }

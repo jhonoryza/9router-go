@@ -54,7 +54,8 @@ func ForwardGemini(ctx context.Context, client *http.Client, cfg *providers.Prov
 			}
 		}
 
-		wrapped, err := translator.WrapAntigravityImageRequest(prompt, "", projectID, cleanModel, aspectRatio)
+		sessID := handlerutil.GetSessionID(ctx)
+		wrapped, err := translator.WrapAntigravityImageRequest(prompt, "", projectID, cleanModel, aspectRatio, sessID)
 		if err != nil {
 			return nil, fmt.Errorf("wrap antigravity image: %w", err)
 		}
@@ -72,10 +73,20 @@ func ForwardGemini(ctx context.Context, client *http.Client, cfg *providers.Prov
 			}
 		}
 
-		// Wrap for antigravity if needed
+		// Wrap for the lane that needs an envelope.
 		sendBody = geminiBody
-		if projectID != "" {
-			wrapped, err := translator.WrapForAntigravity(geminiBody, projectID, modelName)
+		switch {
+		case cfg.Format == "gemini-cli":
+			// Cloud Code Assist: {project, model, request} with no userId,
+			// requestType or requestId — the CLI's own shape.
+			wrapped, err := translator.WrapForGeminiCLI(geminiBody, projectID, modelName)
+			if err != nil {
+				return nil, fmt.Errorf("wrap for gemini-cli: %w", err)
+			}
+			sendBody = wrapped
+		case projectID != "":
+			sessID := handlerutil.GetSessionID(ctx)
+			wrapped, err := translator.WrapForAntigravity(geminiBody, projectID, modelName, sessID)
 			if err != nil {
 				return nil, fmt.Errorf("wrap for antigravity: %w", err)
 			}
@@ -96,16 +107,36 @@ func ForwardGemini(ctx context.Context, client *http.Client, cfg *providers.Prov
 		action = "streamGenerateContent?alt=sse"
 	}
 	var requestURL string
-	if projectID != "" {
+	switch {
+	case cfg.Format == "gemini-cli":
+		// The v1internal root takes the action directly; the model rides in
+		// the envelope, not the path.
+		requestURL = fmt.Sprintf("%s:%s", baseURL, action)
+	case projectID != "":
 		requestURL = fmt.Sprintf("%s/v1internal:%s", baseURL, action)
-	} else {
+	default:
 		requestURL = fmt.Sprintf("%s/v1beta/models/%s:%s", baseURL, modelName, action)
+	}
+
+	accept := "application/json"
+	if isStream {
+		accept = "text/event-stream"
 	}
 
 	headers := map[string]string{
 		"Content-Type":  "application/json",
 		"Authorization": "Bearer " + apiKey,
 		"User-Agent":    providers.AntigravityCLIUserAgent,
+		"Accept":        accept,
+	}
+	if isStream {
+		headers["Accept-Encoding"] = "identity"
+	}
+	if cfg.Format == "gemini-cli" {
+		// Cloud Code Assist identifies the CLI in two more headers and answers
+		// 403 without them.
+		headers["User-Agent"] = translator.GeminiCLIUserAgent(modelName)
+		headers["X-Goog-Api-Client"] = translator.GeminiCLIApiClient
 	}
 
 	req, err := http.NewRequestWithContext(ctx, "POST", requestURL, bytes.NewReader(sendBody))
@@ -126,6 +157,7 @@ func ForwardGemini(ctx context.Context, client *http.Client, cfg *providers.Prov
 		}
 		return nil, fmt.Errorf("upstream request: %w", err)
 	}
+	UnwrapIdentityGzip(req, resp)
 	if resp.StatusCode != http.StatusOK {
 		errBody, readErr := io.ReadAll(io.LimitReader(resp.Body, constants.UpstreamErrLimit))
 		resp.Body.Close()
@@ -164,7 +196,11 @@ func ForwardGemini(ctx context.Context, client *http.Client, cfg *providers.Prov
 						req2.Header.Set(k, v)
 					}
 					if resp2, err := client.Do(req2); err == nil {
+						UnwrapIdentityGzip(req2, resp2)
 						if resp2.StatusCode == http.StatusOK {
+							if sessID := handlerutil.GetSessionID(ctx); sessID != "" {
+								translator.PurgeSessionThoughtSignatures(sessID)
+							}
 							return resp2, nil
 						}
 						errBody2, _ := io.ReadAll(io.LimitReader(resp2.Body, constants.UpstreamErrLimit))
@@ -181,7 +217,11 @@ func ForwardGemini(ctx context.Context, client *http.Client, cfg *providers.Prov
 										req3.Header.Set(k, v)
 									}
 									if resp3, err := client.Do(req3); err == nil {
+										UnwrapIdentityGzip(req3, resp3)
 										if resp3.StatusCode == http.StatusOK {
+											if sessID := handlerutil.GetSessionID(ctx); sessID != "" {
+												translator.PurgeSessionThoughtSignatures(sessID)
+											}
 											return resp3, nil
 										}
 										errBody3, _ := io.ReadAll(io.LimitReader(resp3.Body, constants.UpstreamErrLimit))
